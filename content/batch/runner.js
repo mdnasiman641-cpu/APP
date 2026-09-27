@@ -13,7 +13,7 @@
   const S = NS.state;
   const { log } = NS.logger;
   const { FacebookTransientError, PageCrashedError } = NS.errors;
-  const { waitFor, settle } = NS.wait;
+  const { waitFor } = NS.wait;
 
   let onRunEnd = () => {};
 
@@ -191,14 +191,17 @@
   const STAGE_LOG = {
     reacquired: (n, v) => `row=${n} reacquired=${v}`,
     'already-scheduled': (n) => `row=${n} already scheduled`,
-    'control-found': (n, v) => `row=${n} scheduling control found=${v}`,
+    'control-found': (n, v) => `row=${n} publish-now control found=${v}`,
     'current-mode': (n, v) => `row=${n} currentMode="${v}"`,
-    'control-clicked': (n, v) => `row=${n} scheduling control clicked=${v}`,
+    'control-clicked': (n, v) => `row=${n} publish-now control clicked=${v}`,
     'popover-visible': (n, v) => `row=${n} popover visible=${v}`,
     'current-tab': (n, v) => `row=${n} current tab="${v}"`,
     'schedule-tab-found': (n, v) => `row=${n} schedule tab found=${v}`,
     'tab-initial-selected': (n, v) => `row=${n} schedule tab initial selected=${Boolean(v)}`,
     'schedule-active': (n, v) => `row=${n} schedule active=${v}`,
+    'dom-tab-clicked': (n, v) => `row=${n} schedule tab clicked directly (${v})`,
+    'dom-click-failed': (n, v) => `row=${n} direct schedule tab click failed: ${v}`,
+    'tab-method': (n, v) => `row=${n} schedule tab method=${v}`,
     'popover-opened': (n) => `popover opened (row=${n})`,
     navigating: (n) => `navigating to Schedule tab (row=${n})`,
     'tab-focused': (n, v) => `Schedule tab focused (row=${n}, ${v})`,
@@ -233,18 +236,14 @@
     const slots = validateSchedule(settings, eligible);
     log('SCHEDULE', `plan: ${slots.map((sl) => `${sl.dateISO} ${sl.time24}`).join(', ')}`);
 
-    // Real keyboard input (Tab/Enter) for the Schedule tab; attached before any popover opens
-    // so the browser's "debugging" bar cannot close a popover by resizing the page.
-    try {
-      await NS.bridge.attachKeyboard();
-      await settle(400);
-    } catch (err) {
-      log('SCHEDULE', `[ERROR] keyboard control unavailable: ${err.message}`);
-    }
+    // The Schedule tab is clicked directly; the real keyboard (chrome.debugger) is attached by
+    // the scheduler only if a direct click fails, and released here when the phase ends.
+    const started = Date.now();
     try {
       await scheduleRows(batch, slots, eligible, progressOffset, progressTotal);
     } finally {
-      NS.bridge.releaseKeyboard().catch(() => {});
+      await NS.scheduler.releaseKeyboard();
+      log('SCHEDULE', `[TIMING] phase total=${Date.now() - started}ms rows=${eligible}`);
     }
     S.setProgress(progressOffset + total, progressTotal);
 

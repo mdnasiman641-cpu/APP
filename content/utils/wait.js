@@ -33,10 +33,20 @@
    * @param {object} opts
    *   backoff: polling delays in ms (last one repeats) instead of a fixed pollInterval
    *   observeAttributes: false to wake only on nodes being added/removed
+   *   attributeFilter: which attribute changes wake the check (when observeAttributes)
+   *   root: observe only this subtree (e.g. one popover) instead of the whole body
    */
   function waitFor(
     predicate,
-    { timeout = DEFAULT_TIMEOUT, minInterval = 100, pollInterval = 250, backoff = null, observeAttributes = true, root = document.body } = {}
+    {
+      timeout = DEFAULT_TIMEOUT,
+      minInterval = 100,
+      pollInterval = 250,
+      backoff = null,
+      observeAttributes = true,
+      attributeFilter = ['style', 'class', 'hidden', 'aria-expanded'],
+      root = document.body
+    } = {}
   ) {
     return new Promise((resolve) => {
       let done = false;
@@ -84,7 +94,7 @@
       observer.observe(
         root || document.documentElement,
         observeAttributes
-          ? { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'hidden', 'aria-expanded'] }
+          ? { childList: true, subtree: true, attributes: true, attributeFilter }
           : { childList: true, subtree: true }
       );
       if (backoff) {
