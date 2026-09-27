@@ -1,0 +1,80 @@
+{
+  "manifest_version": 3,
+  "name": "Facebook Bulk Reel Assistant",
+  "version": "1.2.5",
+  "description": "Generates AI descriptions (Gemini, OpenRouter, OpenAI with automatic failover) and applies schedules to Meta Business Suite bulk Reel uploads. Final publishing always stays manual.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "storage",
+    "debugger"
+  ],
+  "host_permissions": [
+    "https://generativelanguage.googleapis.com/*",
+    "https://openrouter.ai/*",
+    "https://api.openai.com/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "action": {
+    "default_title": "Facebook Bulk Reel Assistant",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "options_page": "options/options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://business.facebook.com/*",
+        "https://www.facebook.com/*"
+      ],
+      "js": [
+        "content/navigation-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://business.facebook.com/*",
+        "https://www.facebook.com/*"
+      ],
+      "js": [
+        "content/utils/logger.js",
+        "content/utils/errors.js",
+        "content/utils/dom.js",
+        "content/utils/wait.js",
+        "shared/schedule.js",
+        "content/state/batchState.js",
+        "content/bridge.js",
+        "content/facebook/pageErrors.js",
+        "content/facebook/detector.js",
+        "content/facebook/row.js",
+        "content/facebook/description.js",
+        "content/facebook/scheduler.js",
+        "content/facebook/schedulingDebug.js",
+        "content/batch/rowGenerate.js",
+        "content/batch/runner.js",
+        "content/ui/panel.js",
+        "content/ui/rowButtons.js",
+        "content/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ]
+}

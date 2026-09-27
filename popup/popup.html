@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Bulk Reel Assistant</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <h1>Bulk Reel Assistant</h1>
+  <p id="status">Checking this tab…</p>
+  <dl id="counters" hidden>
+    <div><dt>Detected</dt><dd id="detected">0</dd></div>
+    <div><dt>Descriptions</dt><dd id="applied">0</dd></div>
+    <div><dt>Scheduled</dt><dd id="scheduled">0</dd></div>
+    <div><dt>Errors</dt><dd id="errors">0</dd></div>
+  </dl>
+  <button id="showPanel" hidden>Show panel on this tab</button>
+  <button id="openSettings" class="secondary">Settings</button>
+  <p class="note">Final Publish is always manual.</p>
+  <script src="popup.js"></script>
+</body>
+</html>
