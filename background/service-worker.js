@@ -232,6 +232,11 @@ const handlers = {
     return { key: msg.key };
   },
 
+  async KEY_TYPE(msg, sender) {
+    await Keyboard.type(facebookTabId(sender), msg.text);
+    return {};
+  },
+
   async KEYBOARD_RELEASE(msg, sender) {
     await Keyboard.release(facebookTabId(sender));
     return {};

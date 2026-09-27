@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Facebook Bulk Reel Assistant",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "description": "Generates AI descriptions (Gemini, OpenRouter, OpenAI with automatic failover) and applies schedules to Meta Business Suite bulk Reel uploads. Final publishing always stays manual.",
   "minimum_chrome_version": "116",
   "permissions": [

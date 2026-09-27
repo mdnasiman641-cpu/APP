@@ -39,9 +39,10 @@
     refreshModels: (provider) => send('REFRESH_MODELS', { provider }),
     getAiHealth: () => send('GET_AI_HEALTH'),
     openOptions: () => send('OPEN_OPTIONS'),
-    // Trusted key presses for the scheduler (Tab/arrows move focus; Enter only on the marked tab).
+    // Trusted key presses for the scheduler (Tab/arrows move focus; Enter, Ctrl+A and typing only on the marked target).
     attachKeyboard: () => send('KEYBOARD_ATTACH'),
     pressKey: (key) => send('KEY_PRESS', { key }),
+    typeText: (text) => send('KEY_TYPE', { text }),
     releaseKeyboard: () => send('KEYBOARD_RELEASE')
   };
 })();

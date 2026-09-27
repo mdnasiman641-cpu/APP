@@ -5,7 +5,16 @@
  *   → click the "Schedule" tab inside THAT POPOVER directly (always, even when date/time
  *     fields are already on screen — Facebook shows them on the "Publish now" tab too,
  *     and filling them without switching tabs schedules nothing) → verify Schedule mode
- *   → set date + time → read them back → press Update → verify the row is scheduled.
+ *   → DATE: focus → read its editing format → select all → type the target in that format →
+ *     native input/change events → blur → read back → compare as a calendar date
+ *   → TIME: the same, compared as minutes of the day ("06:00 PM" == "18:00")
+ *   → both re-checked together → press Update → verify the row is scheduled.
+ *
+ * Each field is entered directly first (execCommand insertText, i.e. a native edit that React's
+ * controlled input sees as typing; the native value setter + events only if the browser refuses),
+ * retried once on a reacquired input, and only then typed with the REAL keyboard (Ctrl+A, the
+ * text, Tab) through the same debugger bridge. Update is never pressed before both values read
+ * back correctly.
  *
  * Only when the direct DOM click on the Schedule tab does not make it active does the
  * scheduler fall back to REAL key presses (chrome.debugger via bridge.attachKeyboard/pressKey):
@@ -24,7 +33,7 @@
   const { log } = NS.logger;
   const { isVisible, accessibleName, fieldHints, safeClick, setNativeValue, pressEscape, isPopupTrigger, isForbiddenTarget, hasDropdownAffordance, isInExtensionUi, normalize, textOf, CLICKABLE_SELECTOR } =
     NS.dom;
-  const { waitFor, nextFrame, visibleMatches, MENU_SELECTOR, DIALOG_SELECTOR } = NS.wait;
+  const { waitFor, nextFrame, sleep, visibleMatches, MENU_SELECTOR, DIALOG_SELECTOR } = NS.wait;
   const { ElementNotFoundError, VerificationError, FacebookTransientError } = NS.errors;
 
   const OVERLAY_SELECTOR = `${MENU_SELECTOR}, ${DIALOG_SELECTOR}`;
@@ -59,7 +68,8 @@
   const TAB_CLICK_TIMEOUT = 700;
   const KEY_ACTIVATE_TIMEOUT = 1500;
   const FIELDS_TIMEOUT = 2000;
-  const VALUES_TIMEOUT = 500;
+  const VALUES_TIMEOUT = 800; // after blur: until the field shows the value
+  const STABLE_MS = 80; // …and it still shows it a moment later (not reverted)
   const UPDATE_CLOSE_TIMEOUT = 3000;
   const ROW_VERIFY_TIMEOUT = 1500;
   const CLOSE_TIMEOUT = 500;
@@ -648,19 +658,105 @@
     return date && hasTime ? { date, time, spin } : null;
   }
 
-  function formatDate(input, slot) {
-    if (input.type === 'date') return slot.dateISO;
+  /* Date/time values are compared as calendar dates / minutes of the day, never as text:
+   * the extension plans "2026-09-29 18:00" while Facebook may show "29 September 2026",
+   * "29/9/2026" or "09/29/2026", and "06:00 PM" or "18:00". */
+
+  const MONTH_WORDS = MONTHS_EN.map((m, i) => [m.slice(0, 3), i]).concat(MONTHS_BN.map((m, i) => [m, i]));
+
+  function monthIndex(word) {
+    const w = normalize(word).replace(/\.$/, '');
+    for (const [name, i] of MONTH_WORDS) if (w.startsWith(name)) return i;
+    return -1;
+  }
+
+  /** Is this page's numeric date day-first (29/9/2026) rather than month-first (9/29/2026)? */
+  function localeDayFirst() {
+    try {
+      const lang = document.documentElement.lang || navigator.language || 'en-US';
+      const parts = new Intl.DateTimeFormat(lang).formatToParts(new Date(2026, 0, 15));
+      return parts.findIndex((p) => p.type === 'day') < parts.findIndex((p) => p.type === 'month');
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Day/month order of a numeric date field: the field's own value when it is unambiguous
+   * (a first number over 12), then its placeholder/label, then the page language.
+   */
+  function numericDayFirst(input, current) {
+    const m = /(\d{1,2})[/.-](\d{1,2})[/.-]\d{4}/.exec(current || '');
+    if (m && Number(m[1]) > 12) return true;
+    if (m && Number(m[2]) > 12) return false;
+    const hint = fieldHints(input);
+    if (/dd[/.-]mm/.test(hint)) return true;
+    if (/mm[/.-]dd/.test(hint)) return false;
+    return localeDayFirst();
+  }
+
+  /** @returns {{y: number, m: number, d: number} | null} (m is 0-based) */
+  function parseDateValue(value, dayFirst) {
+    const v = bengaliToAscii(normalize(value));
+    let m = /(\d{4})-(\d{1,2})-(\d{1,2})/.exec(v);
+    if (m) return { y: +m[1], m: +m[2] - 1, d: +m[3] };
+    m = /(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})/.exec(v);
+    if (m) {
+      let [a, b] = [+m[1], +m[2]];
+      const df = a > 12 ? true : b > 12 ? false : dayFirst;
+      return df ? { y: +m[3], m: b - 1, d: a } : { y: +m[3], m: a - 1, d: b };
+    }
+    m = /(\d{1,2})\s+([^\d\s,]+),?\s+(\d{4})/.exec(v); // 29 September 2026
+    if (m && monthIndex(m[2]) >= 0) return { y: +m[3], m: monthIndex(m[2]), d: +m[1] };
+    m = /([^\d\s,]+)\s+(\d{1,2}),?\s+(\d{4})/.exec(v); // September 29, 2026
+    if (m && monthIndex(m[1]) >= 0) return { y: +m[3], m: monthIndex(m[1]), d: +m[2] };
+    return null;
+  }
+
+  function sameDate(value, slot, dayFirst) {
+    const p = parseDateValue(value, dayFirst);
     const d = slot.date;
-    const monthName = MONTHS_EN[d.getMonth()].replace(/^./, (c) => c.toUpperCase());
-    const current = input.value || '';
-    // Facebook's popover shows a long date ("28 September 2026"); mirror whatever shape it uses.
-    if (/^\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}$/.test(current)) return `${d.getDate()} ${monthName} ${d.getFullYear()}`;
-    if (/^[A-Za-z]{3,}\s+\d{1,2},?\s+\d{4}$/.test(current)) return `${monthName} ${d.getDate()}, ${d.getFullYear()}`;
-    const hint = fieldHints(input) + ' ' + current;
-    if (/yyyy-mm-dd/.test(hint) || /^\d{4}-\d{2}-\d{2}$/.test(input.value)) return slot.dateISO;
-    const existing = /^(\d{1,2})\/(\d{1,2})\/\d{4}$/.exec(input.value || '');
-    const dayFirst = /dd\/mm/.test(hint) || (existing && Number(existing[1]) > 12);
-    return dayFirst ? `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}` : `${pad(d.getMonth() + 1)}/${pad(d.getDate())}/${d.getFullYear()}`;
+    return Boolean(p && p.y === d.getFullYear() && p.m === d.getMonth() && p.d === d.getDate());
+  }
+
+  /** Minutes since midnight, or null. "06:00 PM", "6:00pm", "18:00", "৬:০০ PM". */
+  function parseTimeValue(value) {
+    const v = bengaliToAscii(normalize(value));
+    const m = /(\d{1,2})[:.](\d{2})\s*(a\.?m\.?|p\.?m\.?)?/.exec(v);
+    if (!m) return null;
+    let h = +m[1];
+    const mi = +m[2];
+    if (m[3]) {
+      if (h < 1 || h > 12) return null;
+      h = (h % 12) + (m[3].startsWith('p') ? 12 : 0);
+    }
+    return h > 23 || mi > 59 ? null : h * 60 + mi;
+  }
+
+  const sameTime = (value, slot) => parseTimeValue(value) === slot.date.getHours() * 60 + slot.date.getMinutes();
+
+  /**
+   * The target date written the way THIS field writes dates (read while it is focused, because
+   * Facebook may switch "29 September 2026" to "29/9/2026" for editing).
+   */
+  function formatDateLike(input, current, slot) {
+    const d = slot.date;
+    if (input.type === 'date') return slot.dateISO;
+    const month = MONTHS_EN[d.getMonth()].replace(/^./, (c) => c.toUpperCase());
+    const cur = String(current || '').trim();
+    if (/^\d{1,2}\s+[A-Za-z]{3,}\.?\s+\d{4}$/.test(cur)) {
+      const abbr = /^\d{1,2}\s+[A-Za-z]{3}\.?\s/.test(cur) ? month.slice(0, 3) : month;
+      return `${d.getDate()} ${abbr} ${d.getFullYear()}`;
+    }
+    if (/^[A-Za-z]{3,}\.?\s+\d{1,2},?\s+\d{4}$/.test(cur)) {
+      const abbr = /^[A-Za-z]{3}\.?\s/.test(cur) ? month.slice(0, 3) : month;
+      return `${abbr} ${d.getDate()}${cur.includes(',') ? ',' : ''} ${d.getFullYear()}`;
+    }
+    if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(cur) || /yyyy-mm-dd/.test(fieldHints(input))) return slot.dateISO;
+    const sep = (/\d([/.-])\d/.exec(cur) || [, '/'])[1];
+    const padded = /(^|\D)0\d/.test(cur);
+    const [dd, mm] = padded ? [pad(d.getDate()), pad(d.getMonth() + 1)] : [String(d.getDate()), String(d.getMonth() + 1)];
+    return numericDayFirst(input, cur) ? `${dd}${sep}${mm}${sep}${d.getFullYear()}` : `${mm}${sep}${dd}${sep}${d.getFullYear()}`;
   }
 
   function to12h(d) {
@@ -668,39 +764,171 @@
     return { h, mm: pad(d.getMinutes()), ampm: d.getHours() < 12 ? 'AM' : 'PM' };
   }
 
-  function formatTime(input, slot) {
+  /** The target time written the way THIS field writes times ("06:00 PM", "6:00 pm", "18:00"). */
+  function formatTimeLike(input, current, slot) {
     if (input.type === 'time') return slot.time24;
-    const hint = fieldHints(input) + ' ' + (input.value || '');
-    const existing24 = /^([01]\d|2[0-3]):\d{2}$/.exec(input.value || '');
-    if (existing24 && !/am|pm/.test(hint)) return slot.time24;
+    const cur = String(current || '').trim();
+    const twelve = /[ap]\.?m\.?/i.test(cur) || (!cur && /am|pm/.test(fieldHints(input)));
+    const padHour = /^0\d/.test(cur);
+    if (!twelve) return padHour || !cur ? slot.time24 : `${slot.date.getHours()}:${pad(slot.date.getMinutes())}`;
     const { h, mm, ampm } = to12h(slot.date);
-    return `${h}:${mm} ${ampm}`;
+    const mer = /[ap]m/.test(cur) ? ampm.toLowerCase() : ampm;
+    return `${padHour ? pad(h) : h}:${mm}${/\d\s+[ap]/i.test(cur) || !cur ? ' ' : ''}${mer}`;
   }
 
-  function typeInto(el, str) {
-    el.focus();
-    for (const ch of str) {
-      const opts = { key: ch, bubbles: true, cancelable: true };
-      el.dispatchEvent(new KeyboardEvent('keydown', opts));
-      el.dispatchEvent(new KeyboardEvent('keyup', opts));
+  /** The date/time the fields hold, as values the planner can compare (for row verification). */
+  function fieldsMatch(inputs, slot) {
+    const dateOk = sameDate(inputs.date.value, slot, numericDayFirst(inputs.date, inputs.date.value));
+    const timeOk = inputs.time ? sameTime(inputs.time.value, slot) : sameTime(spinText(inputs.spin), slot);
+    return dateOk && timeOk;
+  }
+
+  const spinValue = (el) => (el ? el.getAttribute('aria-valuetext') || el.getAttribute('aria-valuenow') || textOf(el) : '');
+  const spinText = (spin) => (spin?.hour ? `${spinValue(spin.hour)}:${pad(parseInt(bengaliToAscii(spinValue(spin.minute)), 10) || 0)} ${spinValue(spin.meridiem)}`.trim() : '');
+
+  /**
+   * DIRECT: focus → select all (Ctrl+A equivalent) → insert the text as a native edit
+   * (execCommand fires real beforeinput/input events, exactly what React's onChange listens
+   * to) → if the browser refused, the native value setter + input event (so React's value
+   * tracker sees the change; never `.value =` alone) → change → blur (commit).
+   */
+  function directEnter(input, text) {
+    input.focus({ preventScroll: true });
+    // Native type="date"/"time" inputs have no text selection; they take the setter below.
+    const selectable = !/^(date|time|datetime-local)$/.test(input.type);
+    let inserted = false;
+    if (selectable) {
+      try {
+        input.select();
+        input.setSelectionRange(0, input.value.length);
+        inserted = document.execCommand('insertText', false, text);
+      } catch {
+        inserted = false;
+      }
     }
+    if (!inserted || input.value !== text) setNativeValue(input, text);
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.blur();
   }
 
-  function setDate(inputs, slot) {
-    setNativeValue(inputs.date, formatDate(inputs.date, slot));
-    inputs.date.blur();
+  /** Wait until `ok()` holds and still holds a moment later (Facebook may reformat or revert on blur). */
+  async function settledTrue(ok, scope) {
+    await nextFrame();
+    if (!ok() && !(await waitFor(ok, { timeout: VALUES_TIMEOUT, minInterval: 16, pollInterval: 40, root: observeRootOf(scope) }))) return false;
+    await sleep(STABLE_MS);
+    await nextFrame();
+    return ok();
   }
 
-  function setTime(inputs, slot) {
-    if (inputs.time) {
-      setNativeValue(inputs.time, formatTime(inputs.time, slot));
-      inputs.time.blur();
-      return;
+  /**
+   * Set one field (date or time) and prove it: direct entry, then once more on a reacquired
+   * input, then the REAL keyboard (focus → Ctrl+A → type → Tab). Logs every step as
+   * [DATE][ROW n] … / [TIME][ROW n] ….
+   * @param {object} f { tag, rowNo, getInput: () => Element|null, format(input, current), matches(value, input) }
+   */
+  async function setFieldVerified(f) {
+    const say = (msg) => log(f.tag, `[ROW ${f.rowNo}] ${msg}`);
+    const kind = f.tag.toLowerCase();
+    const attempts = [
+      { how: 'direct', reacquire: false },
+      { how: 'direct', reacquire: true },
+      { how: 'keyboard', reacquire: true }
+    ];
+    let last = '';
+    for (const [i, attempt] of attempts.entries()) {
+      const input = f.getInput();
+      if (!input) throw fail(new ElementNotFoundError(`The ${kind} input is no longer in the Schedule popup`), `${kind}-field`);
+      if (i === 0) say('input found');
+      else say(`retry ${i} (${attempt.how}${attempt.reacquire ? ', input reacquired' : ''})`);
+
+      let target;
+      if (attempt.how === 'direct') {
+        input.focus({ preventScroll: true });
+        await nextFrame(); // Facebook may switch the field to its editing format on focus
+        const before = input.value;
+        target = f.format(input, before);
+        say(`before="${before}"`);
+        say(`target="${target}"`);
+        say('select-all');
+        directEnter(input, target);
+        say('typed');
+      } else {
+        await ensureKeyboard();
+        const fresh = f.getInput();
+        if (!fresh) throw Object.assign(fail(new ElementNotFoundError(`The ${kind} input disappeared when keyboard control started`), `${kind}-field`), { restartRow: true });
+        // The worker types and presses Ctrl+A only while focus is inside this marked field.
+        fresh.setAttribute(KEY_MARKER, '');
+        try {
+          fresh.focus({ preventScroll: true });
+          await nextFrame();
+          const before = fresh.value;
+          target = f.format(fresh, before);
+          say(`before="${before}" (keyboard)`);
+          say(`target="${target}"`);
+          await realKey('SelectAll');
+          say('select-all (Ctrl+A)');
+          try {
+            await NS.bridge.typeText(target);
+          } catch (err) {
+            throw fail(new ElementNotFoundError(`Keyboard: ${err.message}`), 'keyboard');
+          }
+          say('typed (keyboard)');
+        } finally {
+          fresh.removeAttribute(KEY_MARKER);
+        }
+        await realKey('Tab'); // blur, so Facebook commits the typed value
+      }
+
+      const read = () => f.getInput()?.value ?? '';
+      const ok = () => {
+        const el = f.getInput();
+        return Boolean(el && f.matches(el.value, el));
+      };
+      const verified = await settledTrue(ok, input);
+      last = read();
+      say(`after="${last}"`);
+      say(`verified=${verified}`);
+      if (verified) return { value: last, method: attempt.how, attempts: i + 1 };
+      assertNoFacebookError(`setting the ${kind}`);
     }
+    throw fail(new VerificationError(`The ${kind} field did not keep the value (it shows "${last}")`), kind === 'date' ? 'date' : 'time');
+  }
+
+  /** Spin-button time pickers (hour / minute / AM-PM): real keyboard only, then verified. */
+  async function setSpinTimeVerified(rowNo, getSpin, slot) {
+    const say = (msg) => log('TIME', `[ROW ${rowNo}] ${msg}`);
+    say('input found (hour/minute spin buttons)');
+    say(`before="${spinText(getSpin())}"`);
     const { h, mm, ampm } = to12h(slot.date);
-    typeInto(inputs.spin.hour, String(inputs.spin.meridiem ? h : slot.date.getHours()));
-    typeInto(inputs.spin.minute, mm);
-    if (inputs.spin.meridiem) typeInto(inputs.spin.meridiem, ampm[0]);
+    const spin0 = getSpin();
+    const parts = [
+      ['hour', String(spin0.meridiem ? h : slot.date.getHours())],
+      ['minute', mm],
+      ['meridiem', spin0.meridiem ? ampm : '']
+    ];
+    say(`target="${slot.time24}"`);
+    await ensureKeyboard();
+    for (const [name, text] of parts) {
+      const el = getSpin()?.[name];
+      if (!el || !text) continue;
+      el.setAttribute(KEY_MARKER, '');
+      try {
+        el.focus({ preventScroll: true });
+        await nextFrame();
+        await realKey('SelectAll');
+        await NS.bridge.typeText(text).catch((err) => {
+          throw fail(new ElementNotFoundError(`Keyboard: ${err.message}`), 'keyboard');
+        });
+      } finally {
+        el.removeAttribute(KEY_MARKER);
+      }
+    }
+    say('typed (keyboard)');
+    const ok = () => sameTime(spinText(getSpin()), slot);
+    const verified = await settledTrue(ok, getSpin()?.hour);
+    say(`after="${spinText(getSpin())}"`);
+    say(`verified=${verified}`);
+    if (!verified) throw fail(new VerificationError(`The time did not keep the value (it shows "${spinText(getSpin())}")`), 'time');
   }
 
   function timeVariants(slot) {
@@ -750,11 +978,7 @@
    */
   function rowShowsSchedule(rowEl, slot) {
     const inline = findDateTimeInputs(rowEl);
-    if (inline) {
-      const dateOk = inline.date.value === formatDate(inline.date, slot);
-      const timeOk = inline.time ? inline.time.value === formatTime(inline.time, slot) : true;
-      if (dateOk && timeOk) return true;
-    }
+    if (inline && fieldsMatch(inline, slot)) return true;
     const text = bengaliToAscii(normalize(textOf(rowEl, 3000)));
     if (!timeVariants(slot).some((t) => text.includes(t))) return false;
     return dateVariants(slot).some((v) => text.includes(v)) || SCHEDULED_MARKER_RE.test(text);
@@ -771,9 +995,7 @@
       const option = findScheduleOption(overlay);
       const inputs = findDateTimeInputs(overlay);
       if (!option?.chosen || !inputs) return false;
-      const dateOk = inputs.date.value === formatDate(inputs.date, slot);
-      const timeOk = !inputs.time || inputs.time.value === formatTime(inputs.time, slot);
-      return dateOk && timeOk;
+      return fieldsMatch(inputs, slot);
     } catch {
       return false;
     } finally {
@@ -819,107 +1041,31 @@
 
     const opened = new Set(); // overlays this operation opened, for cleanup on failure
     try {
-      // 1–2. click the row's "Publish now" control and wait for its popover
-      let { overlay } = await openPopover(row, onStage);
-      opened.add(overlay);
-      timer.mark('open-popover');
-      assertNoFacebookError('opening the scheduling popover');
-
-      // 3. find the Schedule tab INSIDE this popover
-      onStage('current-tab', currentTab(overlay));
-      const option = findScheduleOption(overlay);
-      onStage('schedule-tab-found', Boolean(option));
-      if (!option) {
-        const offered = clickables(overlay).map((el) => accessibleName(el)).filter(Boolean).slice(0, 6);
-        throw fail(
-          new ElementNotFoundError(`No "Schedule" tab in this row's popover. It offered: ${offered.join(', ') || 'nothing readable'}`),
-          'schedule-tab'
-        );
-      }
-      timer.mark('find-schedule-tab');
-
-      // 4–5. ALWAYS make Schedule the active tab (direct click; keyboard only as fallback)
-      onStage('tab-initial-selected', option.chosen);
-      let method = 'already-selected';
-      if (!option.chosen) {
-        ({ overlay, method } = await activateScheduleTab({ overlay, option, row, rowNo, opened }, onStage, timer));
-        opened.add(overlay);
-      }
-      onStage('tab-method', method);
-      onStage('schedule-active', true);
-      onStage('schedule-mode-verified', true);
-
-      // date/time fields: this popover first, then a separate dialog it opened, then the row
-      const locate = () => {
-        const popover = reacquirePopover(overlay) || overlay;
-        for (const scope of [popover, ...visibleMatches(DIALOG_SELECTOR).filter((o) => !opened.has(o) && !isInExtensionUi(o))]) {
-          if (scope?.isConnected) {
-            const hit = findDateTimeInputs(scope);
-            if (hit) return { scope, inputs: hit };
-          }
+      // Normally one pass. A second pass only when starting the keyboard fallback (Chrome's
+      // "debugging" bar) closed the popover mid-way; the keyboard is attached by then.
+      let result;
+      for (let pass = 1; ; pass++) {
+        try {
+          result = await configurePopover({ ref, row, slot, rowNo, label, opened, onStage, timer });
+          break;
+        } catch (err) {
+          if (!err.restartRow || pass > 1) throw err;
+          log('SCHEDULE', `[ROW ${rowNo}] popup closed when keyboard control started; opening it again`);
+          await closeOpenedOverlays(opened);
+          opened.clear();
+          row = await NS.row.acquireRow(ref);
         }
-        return null;
-      };
-      let found = locate();
-      if (!found) found = await waitFor(locate, { timeout: FIELDS_TIMEOUT, minInterval: 16, pollInterval: 100, root: observeRootOf(overlay), attributeFilter: TAB_ATTRS });
-      if (!found) {
-        const rowEl = currentRowElement(ref, row);
-        const inRow = rowEl && findDateTimeInputs(rowEl);
-        if (inRow) found = { scope: rowEl, inputs: inRow };
       }
-      timer.mark('wait-fields');
-      if (!found) {
-        onStage('date-field-found', false);
-        onStage('time-field-found', false);
-        throw fail(new ElementNotFoundError('Date/time fields did not appear after selecting Schedule'), 'date-field');
-      }
-      if (found.scope !== overlay && found.scope.matches(OVERLAY_SELECTOR)) opened.add(found.scope);
-      const inputs = found.inputs;
-      onStage('fields-visible', true);
-      onStage('date-field-found', true);
-      onStage('time-field-found', Boolean(inputs.time || inputs.spin.hour));
+      const { scope, method } = result;
 
-      // 6–7. set date, then time
-      const wanted = { date: formatDate(inputs.date, slot), time: inputs.time ? formatTime(inputs.time, slot) : '' };
-      setDate(inputs, slot);
-      onStage('date-set', `${slot.dateISO} (field: ${inputs.date.value})`);
-      timer.mark('set-date');
-      setTime(inputs, slot);
-      onStage('time-set', `${slot.time24}${inputs.time ? ` (field: ${inputs.time.value})` : ''}`);
-      timer.mark('set-time');
-
-      // 8. read both back once React has committed (short poll: input values fire no mutations)
-      const valuesOk = () => inputs.date.value === wanted.date && (!inputs.time || inputs.time.value === wanted.time);
-      await nextFrame();
-      const kept = valuesOk() || (await waitFor(valuesOk, { timeout: VALUES_TIMEOUT, minInterval: 16, pollInterval: 50, root: found.scope }));
-      timer.mark('verify-values');
-      assertNoFacebookError('setting date/time');
-      onStage('values-verified', Boolean(kept));
-      if (!kept) {
-        throw fail(
-          new VerificationError(
-            `${label}: the fields did not keep the values (date "${inputs.date.value}" wanted "${wanted.date}"` +
-              `${inputs.time ? `, time "${inputs.time.value}" wanted "${wanted.time}"` : ''})`
-          ),
-          'values'
-        );
-      }
-      onStage('datetime-set', `${inputs.date.value} ${inputs.time ? inputs.time.value : ''}`.trim());
-
-      // Update must never be pressed while "Publish now" is the active tab.
-      const scope = found.scope.matches(OVERLAY_SELECTOR) ? found.scope : overlay;
-      const stillSchedule = findScheduleOption(scope);
-      if (stillSchedule && hasChoiceState(stillSchedule.el) && !stillSchedule.chosen) {
-        throw fail(new VerificationError(`${label}: the popover switched back from Schedule before Update`), 'schedule-tab-activate');
-      }
-
-      // 9. press this popover's own Update/Save button — never Facebook's final Publish
-      const confirm = findConfirmButton(scope, stillSchedule?.el || option.el);
+      // 9. press this popover's own Update button — never Facebook's final Publish
+      const confirm = findConfirmButton(scope, findScheduleOption(scope)?.el);
       if (!confirm) {
         const offered = clickables(scope).map((el) => accessibleName(el)).filter(Boolean).slice(0, 6);
-        throw fail(new ElementNotFoundError(`No Update/Save button in the popover. It offered: ${offered.join(', ') || 'nothing readable'}`), 'update');
+        throw fail(new ElementNotFoundError(`No Update button in the popup. It offered: ${offered.join(', ') || 'nothing readable'}`), 'update');
       }
       safeClick(confirm, { scopes: [scope], label: 'schedule Update button' });
+      log('UPDATE', `[ROW ${rowNo}] clicked`);
       onStage('update-clicked', true);
       onStage('update', true);
       // Stop waiting the moment the popover closes or Facebook shows its error.
@@ -948,6 +1094,7 @@
         verified = await verifyByReopening(ref, slot);
         timer.mark('verify-reopen');
       }
+      log('UPDATE', `[ROW ${rowNo}] success=${verified}`);
       if (!verified) {
         onStage('verified', false);
         throw fail(new VerificationError(`${label}: Facebook does not show ${slot.dateISO} ${slot.time24} for this row after Update`), 'verify');
@@ -967,5 +1114,129 @@
     }
   }
 
-  NS.scheduler = { scheduleRow, releaseKeyboard, rowShowsSchedule, findDateTimeInputs, findRowControl, findPublishNowControl };
+  /**
+   * Steps 2–8 for one row: open the popup from "Publish now", make Schedule the active tab,
+   * set and verify the date, then the time, and re-check both (and the Schedule tab) right
+   * before Update may be pressed.
+   * @returns {Promise<{scope: Element, method: string}>} the popup holding Update
+   */
+  async function configurePopover({ ref, row, slot, rowNo, label, opened, onStage, timer }) {
+    // 2–4. click the row's "Publish now" control and wait for its popup
+    let { overlay } = await openPopover(row, onStage);
+    opened.add(overlay);
+    timer.mark('open-popover');
+    assertNoFacebookError('opening the scheduling popup');
+    log('SCHEDULE', `[ROW ${rowNo}] popup opened`);
+
+    // find the Schedule tab INSIDE this popup
+    onStage('current-tab', currentTab(overlay));
+    const option = findScheduleOption(overlay);
+    onStage('schedule-tab-found', Boolean(option));
+    if (!option) {
+      const offered = clickables(overlay).map((el) => accessibleName(el)).filter(Boolean).slice(0, 6);
+      throw fail(new ElementNotFoundError(`No "Schedule" tab in this row's popup. It offered: ${offered.join(', ') || 'nothing readable'}`), 'schedule-tab');
+    }
+    timer.mark('find-schedule-tab');
+
+    // 5. ALWAYS make Schedule the active tab (direct click; keyboard only as fallback)
+    onStage('tab-initial-selected', option.chosen);
+    let method = 'already-selected';
+    if (!option.chosen) {
+      ({ overlay, method } = await activateScheduleTab({ overlay, option, row, rowNo, opened }, onStage, timer));
+      opened.add(overlay);
+    }
+    onStage('tab-method', method);
+    onStage('schedule-active', true);
+    onStage('schedule-mode-verified', true);
+    log('SCHEDULE', `[ROW ${rowNo}] schedule tab active (${method})`);
+
+    // the date/time fields: this popup first, then a separate dialog it opened, then the row
+    const locate = () => {
+      const popover = reacquirePopover(overlay) || (overlay.isConnected ? overlay : null);
+      const scopes = [popover, ...visibleMatches(DIALOG_SELECTOR).filter((o) => !opened.has(o) && !isInExtensionUi(o))];
+      for (const scope of scopes) {
+        if (scope?.isConnected) {
+          const hit = findDateTimeInputs(scope);
+          if (hit) return { scope, inputs: hit };
+        }
+      }
+      return null;
+    };
+    let found = locate();
+    if (!found) found = await waitFor(locate, { timeout: FIELDS_TIMEOUT, minInterval: 16, pollInterval: 100, root: observeRootOf(overlay), attributeFilter: TAB_ATTRS });
+    if (!found) {
+      const rowEl = currentRowElement(ref, row);
+      const inRow = rowEl && findDateTimeInputs(rowEl);
+      if (inRow) found = { scope: rowEl, inputs: inRow };
+    }
+    timer.mark('wait-fields');
+    if (!found) {
+      onStage('date-field-found', false);
+      onStage('time-field-found', false);
+      throw fail(new ElementNotFoundError('Date/time fields did not appear after selecting Schedule'), 'date-field');
+    }
+    if (found.scope !== overlay && found.scope.matches(OVERLAY_SELECTOR)) opened.add(found.scope);
+    onStage('fields-visible', true);
+    onStage('date-field-found', true);
+    onStage('time-field-found', Boolean(found.inputs.time || found.inputs.spin.hour));
+
+    // Fresh inputs on every read: React may re-render the popup and replace them.
+    const fields = () => {
+      const scope = found.scope.isConnected ? found.scope : reacquirePopover(overlay);
+      return (scope && findDateTimeInputs(scope)) || null;
+    };
+    const lost = (kind) =>
+      Object.assign(fail(new ElementNotFoundError(`The Schedule popup closed while setting the ${kind}`), `${kind}-field`), { restartRow: true });
+
+    // 6–15. DATE
+    const date = await setFieldVerified({
+      tag: 'DATE',
+      rowNo,
+      getInput: () => fields()?.date || null,
+      format: (input, current) => formatDateLike(input, current, slot),
+      matches: (value, input) => sameDate(value, slot, numericDayFirst(input, value))
+    }).catch((err) => {
+      throw fields() ? err : lost('date');
+    });
+    onStage('date-set', `${slot.dateISO} (field: ${date.value}, ${date.method})`);
+    timer.mark('set-date');
+
+    // 16–25. TIME
+    if (fields()?.time) {
+      const time = await setFieldVerified({
+        tag: 'TIME',
+        rowNo,
+        getInput: () => fields()?.time || null,
+        format: (input, current) => formatTimeLike(input, current, slot),
+        matches: (value) => sameTime(value, slot)
+      }).catch((err) => {
+        throw fields() ? err : lost('time');
+      });
+      onStage('time-set', `${slot.time24} (field: ${time.value}, ${time.method})`);
+    } else {
+      if (!fields()) throw lost('time');
+      await setSpinTimeVerified(rowNo, () => fields()?.spin || null, slot);
+      onStage('time-set', `${slot.time24} (spin buttons)`);
+    }
+    timer.mark('set-time');
+
+    // 26. Update only after BOTH values read back correctly — checked again together, because
+    // setting the time can make a date picker re-render — and Schedule is still the active tab.
+    const now = fields();
+    const bothOk = Boolean(now && fieldsMatch(now, slot));
+    onStage('values-verified', bothOk);
+    if (!bothOk) {
+      const shown = now ? `date "${now.date.value}", time "${now.time ? now.time.value : spinText(now.spin)}"` : 'no fields';
+      throw fail(new VerificationError(`${label}: the date/time changed after being set (${shown}; wanted ${slot.dateISO} ${slot.time24})`), 'values');
+    }
+    onStage('datetime-set', `${now.date.value} ${now.time ? now.time.value : spinText(now.spin)}`.trim());
+    const scope = found.scope.matches(OVERLAY_SELECTOR) ? found.scope : reacquirePopover(overlay) || overlay;
+    const stillSchedule = findScheduleOption(scope);
+    if (stillSchedule && hasChoiceState(stillSchedule.el) && !stillSchedule.chosen) {
+      throw fail(new VerificationError(`${label}: the popup switched back from Schedule before Update`), 'schedule-tab-activate');
+    }
+    return { scope, method };
+  }
+
+  NS.scheduler = { scheduleRow, releaseKeyboard, rowShowsSchedule, findDateTimeInputs, findRowControl, findPublishNowControl, parseDateValue, parseTimeValue, formatDateLike, formatTimeLike };
 })();
