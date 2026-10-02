@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QInputDialog, QMessageBox
 
 from app.config.constants import TRASH_DIR_NAME
 from app.context import AppContext
-from app.i18n import set_language, tr
+from app.i18n import set_language
 from app.ui.history_window import HistoryDialog, format_time
 from app.ui.main_window import MainWindow
 from app.ui.saved_prompts_window import SavedPromptsDialog

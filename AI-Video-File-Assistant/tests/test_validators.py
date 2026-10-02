@@ -60,8 +60,8 @@ def test_trailing_leading_and_empty(name):
 
 
 def test_invisible_characters_rejected():
-    assert validate_component("evil‮gnp.mp4")
-    assert validate_component("zero​width.mp4")
+    assert validate_component("evil\u202egnp.mp4")
+    assert validate_component("zero\u200bwidth.mp4")
 
 
 def test_length_limit_counts_utf16_units():

@@ -80,7 +80,7 @@ def extract_json(text: str) -> Any:
     """Decode the first JSON value in ``text``, ignoring Markdown fences and surrounding prose."""
     if len(text) > MAX_AI_RESPONSE_CHARS:
         raise ResponseError("The AI answer is unreasonably large.")
-    cleaned = text.strip().lstrip("﻿")
+    cleaned = text.strip().lstrip("\ufeff")
     cleaned = _FENCE.sub("", cleaned).strip()
     try:
         return json.loads(cleaned)

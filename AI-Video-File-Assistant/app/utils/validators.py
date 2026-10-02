@@ -24,7 +24,7 @@ _CONTROL_CHARS = {chr(i) for i in range(32)}
 _ILLEGAL_SET = set(ILLEGAL_FILENAME_CHARS) | _CONTROL_CHARS
 _MULTI_SPACE = re.compile(r"\s{2,}")
 # Zero-width / bidirectional controls can be used to disguise names.
-_INVISIBLE = re.compile("[​‎‏‪-‮⁦-⁩﻿]")
+_INVISIBLE = re.compile("[\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 
 
 def utf16_length(text: str) -> int:

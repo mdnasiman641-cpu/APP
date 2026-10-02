@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from app.config.settings import SettingsManager
 from app.context import AppContext
 from app.database.database import Database
 from app.utils import helpers
