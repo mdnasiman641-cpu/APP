@@ -36,9 +36,11 @@ class WorkerSignals(QObject):
 class BaseWorker(QRunnable):
     """Runs :meth:`execute` off the UI thread and relays its outcome via signals."""
 
+    signals_class: type[WorkerSignals] = WorkerSignals
+
     def __init__(self) -> None:
         super().__init__()
-        self.signals = WorkerSignals()
+        self.signals = self.signals_class()
         self.cancel_event = threading.Event()
         # The thread pool owns the runnable (autoDelete): the C++ object is freed only after
         # run() has fully returned, so dropping the Python reference in a ``finished`` slot is safe.

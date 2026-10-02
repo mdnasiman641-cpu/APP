@@ -1,11 +1,11 @@
-"""Main application window."""
+"""Main application window: folder → files → AI command → preview → apply → undo."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QThreadPool, QUrl
+from PySide6.QtCore import QByteArray, QEvent, QObject, Qt, QThreadPool, QUrl
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,43 +23,64 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.ai.ai_router import make_router
+from app.ai.pipeline import PipelineRequest, PipelineResult
 from app.config.constants import APP_NAME, FileKind
 from app.context import AppContext
+from app.database.models import CommandRecord, SavedPrompt
+from app.files.operation_manager import ExecutionResult, OperationManager, UndoResult
+from app.files.plan import OpKind, Plan
 from app.files.scanner import ScanResult
-from app.i18n import tr
+from app.i18n import set_language, tr
+from app.ui.command_panel import CommandPanel
 from app.ui.files_panel import FilesPanel
-from app.i18n import set_language
+from app.ui.preview_window import PreviewPanel
 from app.ui.settings_window import SettingsDialog
 from app.ui.theme import PALETTES, apply_theme, resolve_theme
 from app.ui.widgets import Card, IconBinder, Retranslator, make_button
-from app.utils.helpers import resource_path
+from app.utils.helpers import classify_extension, resource_path
 from app.utils.logger import get_logger, setup_logging
+from app.workers.ai_worker import PlanWorker
 from app.workers.base_worker import BaseWorker
+from app.workers.operation_worker import OperationWorker, UndoWorker
 from app.workers.scan_worker import ScanWorker
 
 log = get_logger("ui.main")
 
 
 class MainWindow(QMainWindow):
-    """Dashboard: folder → files → AI command → preview → apply → undo."""
+    """Dashboard that drives the whole workflow."""
 
     def __init__(self, ctx: AppContext) -> None:
         super().__init__()
         self.ctx = ctx
         self.settings = ctx.settings.load()
+        self.manager = OperationManager(ctx.db)
         self.workspace: Path | None = None
         self._tr = Retranslator()
         self._pool = QThreadPool.globalInstance()
         self._workers: set[BaseWorker] = set()
         self._scan_generation = 0
+        self._plan_generation = 0
         self._busy = 0
-        self._pending_check: set[str] = set()
-        self._icon_color = PALETTES[resolve_theme(self.settings.theme)]["muted"]
+        self._operation_running = False
+        self._pending_paths: set[str] = set()  # relative paths to tick after the next scan
+        self._pending_statuses: dict[str, str] = {}
+        self._sticky_status: tuple[str, str] | None = None  # shown after the next scan instead of the file count
+        self._plan_worker: PlanWorker | None = None
+        self._active_command = ""
+        self._active_provider = ""
+        self._palette = PALETTES[resolve_theme(self.settings.theme)]
+        self._icon_color = self._palette["muted"]
         self._icons = IconBinder(self._icon_color)
 
         self._tr.title(self, "app.title")
-        self.setMinimumSize(900, 640)
-        self.resize(1200, 820)
+        self.setMinimumSize(980, 680)
+        screen = QApplication.primaryScreen().availableGeometry() if QApplication.primaryScreen() else None
+        self.resize(
+            min(1280, int(screen.width() * 0.94)) if screen else 1240,
+            min(1000, int(screen.height() * 0.94)) if screen else 900,
+        )
         icon_path = resource_path("icons", "app.png")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -69,12 +90,14 @@ class MainWindow(QMainWindow):
         self._restore_geometry()
         QApplication.instance().installEventFilter(self)  # type: ignore[union-attr]
         self.files_panel.set_filter(self.settings.default_file_filter)
+        self.command_panel.set_provider(self.settings.default_provider)
+        self.refresh_prompt_menus()
+        self.refresh_undo_button()
         self.show_status(tr("status.ready"))
-        if self.settings.reopen_last_folder and self.settings.last_folder:
-            if Path(self.settings.last_folder).is_dir():
-                self.load_folder(self.settings.last_folder)
+        if self.settings.reopen_last_folder and self.settings.last_folder and Path(self.settings.last_folder).is_dir():
+            self.load_folder(self.settings.last_folder)
 
-    # ------------------------------------------------------------------ build
+    # ================================================================== build
     def _build_ui(self) -> None:
         root = QWidget()
         root.setObjectName("Root")
@@ -91,10 +114,25 @@ class MainWindow(QMainWindow):
         self.splitter.setChildrenCollapsible(False)
         self.files_panel = FilesPanel(self._icons)
         self.files_panel.selection_changed.connect(self._on_selection_changed)
-        self.splitter.addWidget(self.files_panel)
+        self.command_panel = CommandPanel(self._icons)
+        self.command_panel.generate_requested.connect(self.generate_preview)
+        self.command_panel.cancel_requested.connect(self.cancel_planning)
+        self.command_panel.saved_prompt_chosen.connect(self._use_saved_prompt)
+        self.command_panel.recent_command_chosen.connect(self._use_recent_command)
+        self.preview_panel = PreviewPanel(self._icons)
+        self.preview_panel.set_palette(self._palette)
+        self.preview_panel.apply_requested.connect(self.apply_changes)
+        self.preview_panel.cancel_requested.connect(self.clear_preview)
+        for panel in (self.files_panel, self.command_panel, self.preview_panel):
+            self.splitter.addWidget(panel)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 0)
+        self.splitter.setStretchFactor(2, 3)
+        self.splitter.setSizes([280, 190, 260])
         layout.addWidget(self.splitter, 1)
 
         self._build_status_bar()
+        self.add_header_button("undo", "undo", "header.undo", "header.undo_tip", self.undo_last)
         self.add_header_button("settings", "settings", "header.settings", "header.settings_tip", self.open_settings)
 
     def _build_header(self) -> QHBoxLayout:
@@ -109,14 +147,15 @@ class MainWindow(QMainWindow):
         self.header_buttons: dict[str, QPushButton] = {}
         return row
 
-    def add_header_button(self, key: str, icon_name: str, text_key: str, tip_key: str, handler: Callable[[], None]) -> None:
-        """Add a button to the top-right of the header (used for Prompts / History / Settings)."""
+    def add_header_button(self, key: str, icon_name: str, text_key: str, tip_key: str, handler: Callable[[], None]) -> QPushButton:
+        """Add a button to the top-right of the header (Prompts / History / Undo / Settings)."""
         button = make_button(
             text_key, self._tr, icon=icon_name, binder=self._icons, name="HeaderButton", tooltip_key=tip_key, icon_size=18
         )
         button.clicked.connect(handler)
         self.header_buttons[key] = button
         self.header_layout.addWidget(button)
+        return button
 
     def _build_folder_card(self) -> Card:
         card = Card("folder.title")
@@ -137,21 +176,13 @@ class MainWindow(QMainWindow):
         self.refresh_button = make_button("folder.refresh", self._tr, icon="refresh", binder=self._icons, tooltip_key="folder.refresh_tip")
         self.refresh_button.clicked.connect(self.refresh)
         row.addWidget(self.refresh_button)
-        card.body.addLayout(row)
-
-        row2 = QHBoxLayout()
         self.subfolders_check = QCheckBox()
         self._tr.text(self.subfolders_check, "folder.subfolders")
         self._tr.tooltip(self.subfolders_check, "folder.subfolders_tip")
         self.subfolders_check.setChecked(self.settings.include_subfolders)
         self.subfolders_check.toggled.connect(self._on_subfolders_toggled)
-        row2.addWidget(self.subfolders_check)
-        row2.addStretch(1)
-        hint = QLabel()
-        hint.setObjectName("DropHint")
-        self._tr.text(hint, "folder.drop_hint")
-        row2.addWidget(hint)
-        card.body.addLayout(row2)
+        row.addWidget(self.subfolders_check)
+        card.body.addLayout(row)
         return card
 
     def _build_status_bar(self) -> None:
@@ -169,7 +200,7 @@ class MainWindow(QMainWindow):
         self.provider_label.setContentsMargins(12, 0, 8, 0)
         bar.addPermanentWidget(self.provider_label)
 
-    # ----------------------------------------------------------------- status
+    # ================================================================== status
     def show_status(self, text: str, kind: str = "info") -> None:
         """Show a message in the status bar (``kind``: info / success / warning / error)."""
         self.status_label.setText(text)
@@ -193,7 +224,7 @@ class MainWindow(QMainWindow):
         else:
             self.progress.hide()
 
-    # ----------------------------------------------------------------- workers
+    # ================================================================= workers
     def run_worker(
         self,
         worker: BaseWorker,
@@ -204,7 +235,7 @@ class MainWindow(QMainWindow):
         on_progress: Callable[[int, int, str], None] | None = None,
         busy: bool = True,
     ) -> BaseWorker:
-        """Start ``worker`` on the thread pool; the window keeps it alive until it finishes."""
+        """Start ``worker`` on the thread pool; the window keeps a reference until it finishes."""
         self._workers.add(worker)
         if busy:
             self._busy += 1
@@ -212,10 +243,7 @@ class MainWindow(QMainWindow):
         signals = worker.signals
         if on_result:
             signals.result.connect(on_result)
-        if on_error:
-            signals.error.connect(on_error)
-        else:
-            signals.error.connect(lambda msg, _exc: self._show_error(msg))
+        signals.error.connect(on_error or (lambda msg, _exc: self._show_error(msg)))
         if on_cancelled:
             signals.cancelled.connect(on_cancelled)
         signals.progress.connect(on_progress or self._default_progress)
@@ -237,10 +265,10 @@ class MainWindow(QMainWindow):
                 self._set_busy(False)
 
     def _show_error(self, message: str) -> None:
-        self.show_status(message, "error")
+        self.show_status(message.splitlines()[0] if message else "", "error")
         QMessageBox.warning(self, APP_NAME, message)
 
-    # ------------------------------------------------------------------ folder
+    # =================================================================== folder
     def browse_folder(self) -> None:
         start = str(self.workspace) if self.workspace else self.settings.last_folder or str(Path.home())
         chosen = QFileDialog.getExistingDirectory(self, tr("folder.dialog_title"), start)
@@ -256,9 +284,12 @@ class MainWindow(QMainWindow):
         """Select ``path`` as the workspace and scan it."""
         folder = Path(path)
         if not folder.is_dir():
-            self.show_status(tr("error.folder_missing", path=str(folder)), "error")
-            QMessageBox.warning(self, APP_NAME, tr("error.folder_missing", path=str(folder)))
+            message = tr("error.folder_missing", path=str(folder))
+            self.show_status(message, "error")
+            QMessageBox.warning(self, APP_NAME, message)
             return
+        if self.workspace is not None and folder != self.workspace:
+            self.clear_preview()
         self.workspace = folder
         self.folder_edit.setText(str(folder))
         self.ctx.settings.update(last_folder=str(folder))
@@ -273,7 +304,8 @@ class MainWindow(QMainWindow):
         self._scan_generation += 1
         generation = self._scan_generation
         worker = ScanWorker(self.workspace, self.subfolders_check.isChecked())
-        self.show_status(tr("status.scanning"))
+        if self._sticky_status is None:
+            self.show_status(tr("status.scanning"))
         self.run_worker(
             worker,
             on_result=lambda res: self._on_scan_done(generation, res),  # type: ignore[arg-type]
@@ -284,11 +316,18 @@ class MainWindow(QMainWindow):
         if generation != self._scan_generation:
             return  # a newer scan superseded this one
         self.files_panel.set_entries(result.entries)
-        if self._pending_check:
-            names = self._pending_check
-            self._pending_check = set()
-            self.files_panel.check_paths(e.rel_path for e in result.entries if e.name in names)
-        self.show_status(tr("status.files_found_in", count=len(result.entries), folder=result.root.name or str(result.root)))
+        if self._pending_paths:
+            wanted, self._pending_paths = self._pending_paths, set()
+            self.files_panel.check_paths(wanted)
+        if self._pending_statuses:
+            statuses, self._pending_statuses = self._pending_statuses, {}
+            self.files_panel.model.set_status_map(statuses)
+        if self._sticky_status is not None:
+            text, kind = self._sticky_status
+            self._sticky_status = None
+            self.show_status(text, kind)
+        else:
+            self.show_status(tr("status.files_found_in", count=len(result.entries), folder=result.root.name or str(result.root)))
         log.info("Folder loaded: %d files", len(result.entries))
 
     def _on_scan_failed(self, generation: int, message: str) -> None:
@@ -303,7 +342,312 @@ class MainWindow(QMainWindow):
         if self.workspace is not None:
             self.refresh()
 
-    # --------------------------------------------------------------- settings
+    def _on_selection_changed(self, count: int) -> None:
+        """Hook: the selection changed (the preview is only re-generated on request)."""
+
+    # ============================================================ prompt/history
+    def refresh_prompt_menus(self) -> None:
+        """Rebuild the Saved Prompts / Recent Commands menus from the database."""
+        self.command_panel.set_prompts(self.ctx.db.list_saved_prompts(), self.ctx.db.list_commands(30))
+
+    def _use_saved_prompt(self, prompt: SavedPrompt) -> None:
+        self.command_panel.set_command(prompt.prompt)
+        self.command_panel.set_provider(prompt.provider)
+
+    def _use_recent_command(self, record: CommandRecord) -> None:
+        self.command_panel.set_command(record.command)
+        self.command_panel.set_provider(record.provider)
+
+    # ================================================================== preview
+    def generate_preview(self) -> None:
+        """Ask for a plan (offline parse or AI) for the typed command and show it in the preview."""
+        if self._operation_running or self._plan_worker is not None:
+            return
+        if self.workspace is None:
+            self.show_status(tr("status.choose_folder"), "warning")
+            return
+        command = self.command_panel.command()
+        if not command:
+            self.show_status(tr("pipeline.no_command"), "warning")
+            self.command_panel.edit.setFocus()
+            return
+        files = self.files_panel.selected_entries()
+        if not files:
+            self.show_status(tr("pipeline.no_files"), "warning")
+            return
+        settings = self.ctx.settings.load()
+        self.settings = settings
+        request = PipelineRequest(
+            command=command, files=files, workspace=self.workspace, mode=self.command_panel.provider(),
+            processing=self.command_panel.processing(), settings=settings,
+        )  # fmt: skip
+        self._plan_generation += 1
+        generation = self._plan_generation
+        self._active_command = command
+        worker = PlanWorker(request, make_router(self.ctx.settings))
+        worker.signals.fallback_requested.connect(self._on_fallback_requested)  # type: ignore[attr-defined]
+        self._plan_worker = worker
+        self.command_panel.set_busy(True)
+        self.preview_panel.clear()
+        self.show_status(tr("status.planning"))
+        log.info("Generate preview: %d files, mode=%s, processing=%s", len(files), request.mode.value, request.processing.value)
+        self.run_worker(
+            worker,
+            on_result=lambda res: self._on_plan_ready(generation, res),  # type: ignore[arg-type]
+            on_error=lambda msg, _e: self._on_plan_failed(generation, msg),
+            on_cancelled=lambda: self._on_plan_cancelled(generation),
+        )
+
+    def cancel_planning(self) -> None:
+        if self._plan_worker is not None:
+            self._plan_worker.cancel()
+            self._plan_generation += 1  # ignore whatever the worker still delivers
+            self._plan_worker = None
+            self.command_panel.set_busy(False)
+            self.show_status(tr("status.planning_cancelled"))
+
+    def _on_fallback_requested(self, failed: str, reason: str, next_provider: str) -> None:
+        worker = self._plan_worker
+        if worker is None:
+            return
+        answer = QMessageBox.question(
+            self, APP_NAME, tr("ai.fallback_question", failed=failed, next=next_provider, reason=reason),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes,
+        )  # fmt: skip
+        worker.answer_fallback(answer == QMessageBox.StandardButton.Yes)
+
+    def _on_plan_failed(self, generation: int, message: str) -> None:
+        if generation != self._plan_generation:
+            return
+        self._plan_worker = None
+        self.command_panel.set_busy(False)
+        self.preview_panel.clear()
+        self.set_provider_text("")
+        self._show_error(message)
+
+    def _on_plan_cancelled(self, generation: int) -> None:
+        if generation == self._plan_generation:
+            self._plan_worker = None
+            self.command_panel.set_busy(False)
+            self.show_status(tr("status.planning_cancelled"))
+
+    def _on_plan_ready(self, generation: int, result: PipelineResult) -> None:
+        if generation != self._plan_generation:
+            return
+        self._plan_worker = None
+        self.command_panel.set_busy(False)
+        plan = result.plan
+        self._active_provider = self.command_panel.provider().value
+        self.ctx.db.add_command(self._active_command, self._active_provider)
+        self.refresh_prompt_menus()
+        self.set_provider_text(tr("status.provider", text=result.provider_text))
+        info = " — ".join(filter(None, [result.provider_text, plan.summary]))
+        self.preview_panel.set_plan(plan, info)
+        self._mark_file_statuses(plan)
+        if plan.sort is not None:
+            self.files_panel.apply_sort(plan.sort.by, plan.sort.descending)
+        log.info("Plan ready via %s: %s", result.provider_used, dict(plan.counts()))
+
+        count = self.preview_panel.apply_count()
+        if count == 0 and plan.sort is not None:
+            self.show_status(tr("status.sorted_only", text=plan.summary or ""), "success")
+            return
+        if count == 0:
+            self.show_status(tr("status.nothing_to_change"), "warning")
+            return
+        self.show_status(tr("status.plan_ready", count=count), "success")
+        if self._can_auto_apply(plan):
+            self._start_apply(plan)
+
+    def _can_auto_apply(self, plan: Plan) -> bool:
+        """Auto Apply never fires for plans with deletes, conflicts or invalid items."""
+        return self.settings.auto_apply and not plan.has_deletes and not plan.has_blockers and not plan.is_empty
+
+    def _mark_file_statuses(self, plan: Plan) -> None:
+        labels = {
+            OpKind.RENAME: "preview.rename", OpKind.MOVE: "preview.move",
+            OpKind.COPY: "preview.copy", OpKind.DELETE: "preview.delete",
+        }  # fmt: skip
+        statuses = {
+            op.source: "→ " + tr(labels[op.kind])
+            for op in plan.applicable_ops()
+            if op.source and op.kind in labels
+        }
+        self.files_panel.model.set_status_map(statuses)
+
+    def clear_preview(self) -> None:
+        """Discard the current preview (nothing was changed on disk)."""
+        self.preview_panel.clear()
+        self.files_panel.model.set_status_map({})
+        self.set_provider_text("")
+        if self.workspace is not None:
+            self.show_status(tr("status.ready"))
+
+    # =================================================================== apply
+    def apply_changes(self) -> None:
+        """Confirm, then execute the previewed plan."""
+        plan = self.preview_panel.plan
+        if plan is None or self.preview_panel.apply_count() == 0 or self._operation_running:
+            return
+        if not self.confirm_apply(plan):
+            return
+        self._start_apply(plan)
+
+    def confirm_apply(self, plan: Plan) -> bool:
+        """The confirmation dialogs: always for deletes, otherwise per the *Ask before applying* setting."""
+        count = self.preview_panel.apply_count()
+        if self.settings.ask_before_apply:
+            if not self._ask(tr("confirm.apply_title"), tr("confirm.apply", count=count), tr("confirm.apply_button")):
+                return False
+        deletes = len(plan.delete_ops)
+        if deletes:
+            key = "confirm.delete_permanent" if plan.delete_mode == "permanent" else "confirm.delete_trash"
+            if not self._ask(tr("confirm.delete_title"), tr(key, count=deletes), tr("confirm.delete_button"), destructive=True):
+                return False
+        return True
+
+    def _ask(self, title: str, text: str, ok_text: str, *, destructive: bool = False) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setIcon(QMessageBox.Icon.Warning if destructive else QMessageBox.Icon.Question)
+        box.setText(text)
+        ok = box.addButton(ok_text, QMessageBox.ButtonRole.DestructiveRole if destructive else QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton(tr("common.cancel"), QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel if destructive else ok)
+        box.exec()
+        return box.clickedButton() is ok
+
+    def _start_apply(self, plan: Plan) -> None:
+        self._operation_running = True
+        self._set_controls_locked(True)
+        selected_before = {e.rel_path for e in self.files_panel.selected_entries()}
+        for op in plan.applicable_ops():
+            if op.kind in (OpKind.RENAME, OpKind.MOVE, OpKind.DELETE) and op.source:
+                selected_before.discard(op.source)
+                if op.kind != OpKind.DELETE and op.target:
+                    selected_before.add(op.target)
+        self._pending_paths = selected_before
+        settings = self.ctx.settings.load()
+        worker = OperationWorker(
+            self.manager, plan, command=self._active_command, provider=self._active_provider, keep_history=settings.create_history
+        )
+        self.show_status(tr("status.applying"))
+        self.run_worker(
+            worker,
+            on_result=lambda res: self._on_apply_done(res),  # type: ignore[arg-type]
+            on_error=lambda msg, _e: self._on_apply_crashed(msg),
+        )
+
+    def _on_apply_done(self, result: ExecutionResult) -> None:
+        self._operation_running = False
+        self._set_controls_locked(False)
+        self.refresh_undo_button()
+        if result.ok:
+            self._pending_statuses = dict(result.changes)
+            self.preview_panel.clear()
+            note = f" {tr('status.irreversible', count=result.irreversible)}" if result.irreversible else ""
+            message = tr("status.applied", count=result.applied, id=result.operation_id or "-") + note
+            self._sticky_status = (message, "success")
+            self.show_status(message, "success")
+            self.refresh()
+            return
+        self._pending_paths = set()
+        key = "error.apply_failed_rolled_back" if result.rolled_back else "error.apply_failed"
+        message = tr(key, reason=result.message)
+        self.show_status(message.splitlines()[0], "error")
+        QMessageBox.warning(self, APP_NAME, message)
+        self.preview_panel.clear()
+        self.refresh()
+
+    def _on_apply_crashed(self, message: str) -> None:
+        self._operation_running = False
+        self._set_controls_locked(False)
+        self._pending_paths = set()
+        self._show_error(tr("error.apply_failed", reason=message))
+        self.refresh()
+
+    def _set_controls_locked(self, locked: bool) -> None:
+        """Disable inputs that could change the folder while a batch is running."""
+        for widget in (
+            self.browse_button, self.refresh_button, self.folder_edit, self.subfolders_check,
+            self.command_panel, self.preview_panel, self.files_panel,
+        ):  # fmt: skip
+            widget.setEnabled(not locked)
+        for key in ("undo", "history", "settings", "prompts"):
+            if key in self.header_buttons:
+                self.header_buttons[key].setEnabled(not locked)
+
+    # ==================================================================== undo
+    def refresh_undo_button(self) -> None:
+        button = self.header_buttons.get("undo")
+        if button is None:
+            return
+        record = self.ctx.db.last_undoable_operation()
+        button.setEnabled(record is not None and not self._operation_running)
+        if record is not None:
+            button.setToolTip(tr("header.undo_tip_op", id=record.id, summary=record.summary))
+        else:
+            button.setToolTip(tr("header.undo_tip"))
+
+    def undo_last(self) -> None:
+        record = self.ctx.db.last_undoable_operation()
+        if record is None:
+            self.show_status(tr("status.nothing_to_undo"), "warning")
+            return
+        self.undo_operation(record.id)
+
+    def undo_operation(self, operation_id: int) -> None:
+        """Ask for confirmation (with a pre-check explanation if it cannot be done) and undo."""
+        record = self.ctx.db.get_operation(operation_id)
+        if record is None or self._operation_running:
+            return
+        check = self.manager.check_undo(operation_id)
+        if not check.possible:
+            self._explain_undo_blocked(check.blockers)
+            return
+        text = tr("confirm.undo", id=record.id, summary=record.summary)
+        if check.notes:
+            text += "\n\n" + "\n".join(f"• {n}" for n in check.notes[:6])
+        if not self._ask(tr("confirm.undo_title"), text, tr("confirm.undo_button")):
+            return
+        self._operation_running = True
+        self._set_controls_locked(True)
+        self.show_status(tr("status.undoing"))
+        self.run_worker(
+            UndoWorker(self.manager, operation_id),
+            on_result=lambda res: self._on_undo_done(res, record.workspace),  # type: ignore[arg-type]
+            on_error=lambda msg, _e: self._on_undo_crashed(msg),
+        )
+
+    def _on_undo_done(self, result: UndoResult, workspace: str) -> None:
+        self._operation_running = False
+        self._set_controls_locked(False)
+        self.refresh_undo_button()
+        if result.ok:
+            message = tr("status.undone", count=result.restored)
+            self.show_status(message, "success")
+            if self.workspace is not None and Path(workspace) == self.workspace:
+                self._sticky_status = (message, "success")
+                self.preview_panel.clear()
+                self.refresh()
+            return
+        self._explain_undo_blocked(result.blockers, fallback=result.message)
+
+    def _on_undo_crashed(self, message: str) -> None:
+        self._operation_running = False
+        self._set_controls_locked(False)
+        self.refresh_undo_button()
+        self._show_error(message)
+
+    def _explain_undo_blocked(self, blockers: list[str], fallback: str = "") -> None:
+        lines = blockers or ([fallback] if fallback else [])
+        text = tr("undo.cannot") + "\n\n" + "\n".join(f"• {b}" for b in lines[:8])
+        if len(lines) > 8:
+            text += "\n" + tr("undo.more", count=len(lines) - 8)
+        self.show_status(tr("undo.cannot"), "warning")
+        QMessageBox.information(self, APP_NAME, text)
+
+    # ================================================================ settings
     def open_settings(self) -> None:
         """Show the Settings dialog and apply whatever the user changed."""
         dialog = SettingsDialog(self.ctx, self, self._icon_color)
@@ -319,22 +663,19 @@ class MainWindow(QMainWindow):
             self.retranslate()
         if self.settings.theme != previous.theme:
             apply_theme(QApplication.instance(), self.settings.theme)  # type: ignore[arg-type]
-            self._icon_color = PALETTES[resolve_theme(self.settings.theme)]["muted"]
+            self._palette = PALETTES[resolve_theme(self.settings.theme)]
+            self._icon_color = self._palette["muted"]
             self._icons.refresh(self._icon_color)
+            self.preview_panel.set_palette(self._palette)
         if self.settings.log_level != previous.log_level:
             setup_logging(self.settings.log_level)
         if self.settings.include_subfolders != previous.include_subfolders:
             self.subfolders_check.setChecked(self.settings.include_subfolders)  # triggers a rescan
-        self.on_settings_changed(previous)
+        if self.settings.default_provider != previous.default_provider:
+            self.command_panel.set_provider(self.settings.default_provider)
         self.show_status(tr("status.settings_saved"), "success")
 
-    def on_settings_changed(self, previous: object) -> None:
-        """Hook for panels that depend on settings (provider default etc.)."""
-
-    def _on_selection_changed(self, count: int) -> None:
-        """Hook for later phases (enables/disables command controls)."""
-
-    # -------------------------------------------------------------- drag & drop
+    # ============================================================== drag & drop
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
         """Catch folder/file drops anywhere in this window (child widgets would swallow them)."""
         kind = event.type()
@@ -357,6 +698,8 @@ class MainWindow(QMainWindow):
 
     def handle_drop(self, urls: list[QUrl]) -> None:
         """A dropped folder becomes the workspace; dropped files select themselves in their folder."""
+        if self._operation_running:
+            return
         paths = [Path(u.toLocalFile()) for u in urls if u.isLocalFile()]
         if not paths:
             return
@@ -367,37 +710,38 @@ class MainWindow(QMainWindow):
         folder = first.parent
         same_folder = [p for p in paths if p.parent == folder and p.is_file()]
         skipped = len(paths) - len(same_folder)
-        self._pending_check = {p.name for p in same_folder}
-        if any(p.suffix.lower() and self._kind_of(p) != FileKind.VIDEO for p in same_folder):
+        self._pending_paths = {p.name for p in same_folder}
+        if any(classify_extension(p.suffix) != FileKind.VIDEO for p in same_folder):
             self.files_panel.set_filter("all")
         self.load_folder(folder)
         if skipped:
             self.show_status(tr("status.drop_skipped", count=skipped), "warning")
 
-    @staticmethod
-    def _kind_of(path: Path) -> FileKind:
-        from app.utils.helpers import classify_extension
-
-        return classify_extension(path.suffix)
-
-    # ------------------------------------------------------------------ misc
+    # ===================================================================== misc
     def retranslate(self) -> None:
         self._tr.retranslate()
         self.folder_card.retranslate()
         self.files_panel.retranslate()
+        self.command_panel.retranslate()
+        self.preview_panel.retranslate()
+        self.refresh_prompt_menus()
+        self.refresh_undo_button()
         if not self.status_label.text():
             self.show_status(tr("status.ready"))
 
     def _restore_geometry(self) -> None:
         if self.settings.window_geometry:
-            from PySide6.QtCore import QByteArray
-
             self.restoreGeometry(QByteArray.fromBase64(self.settings.window_geometry.encode("ascii")))
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self._operation_running:
+            answer = QMessageBox.question(self, APP_NAME, tr("confirm.close_busy"))
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
         for worker in list(self._workers):
             worker.cancel()
-        self._pool.waitForDone(3000)
+        self._pool.waitForDone(5000)
         try:
             geometry = bytes(self.saveGeometry().toBase64().data()).decode("ascii")
             self.ctx.settings.update(window_geometry=geometry)
@@ -405,4 +749,3 @@ class MainWindow(QMainWindow):
             log.debug("could not persist window geometry", exc_info=True)
         QApplication.instance().removeEventFilter(self)  # type: ignore[union-attr]
         super().closeEvent(event)
-

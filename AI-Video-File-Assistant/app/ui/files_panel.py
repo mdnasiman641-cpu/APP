@@ -256,6 +256,17 @@ class FilesPanel(Card):
         self._update_order_button()
         self.table.sortByColumn(column, order)
 
+    def apply_sort(self, by: str, descending: bool) -> None:
+        """Sort the table by ``by`` (``name``/``size``/``date``/``type``/``duration``), e.g. for a "sort" command."""
+        columns = {"name": COL_NAME, "size": COL_SIZE, "date": COL_MODIFIED, "type": COL_EXT, "duration": COL_DURATION}
+        column = columns.get(by, COL_NAME)
+        index = next(i for i, (_, col) in enumerate(SORT_COLUMNS) if col == column)
+        with _blocked(self.sort_combo, self.order_button):
+            self.sort_combo.setCurrentIndex(index)
+            self.order_button.setChecked(descending)
+        self._update_order_button()
+        self.table.sortByColumn(column, Qt.SortOrder.DescendingOrder if descending else Qt.SortOrder.AscendingOrder)
+
     def _on_header_sort(self, column: int, order: Qt.SortOrder) -> None:
         for i, (_, col) in enumerate(SORT_COLUMNS):
             if col == column:
