@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -328,10 +329,20 @@ class SettingsDialog(QDialog):
         for value in ("video", "all"):
             self.default_filter.addItem("", value)
         self.read_metadata = self._check("settings.read_metadata", "settings.read_metadata_tip")
+        self.ffmpeg_dir = QLineEdit()
+        self.ffmpeg_dir.setPlaceholderText(tr("settings.ffmpeg_auto"))
+        self.ffmpeg_dir.setToolTip(tr("settings.ffmpeg_dir_tip"))
+        browse = QPushButton()
+        self._tr.text(browse, "settings.browse")
+        browse.clicked.connect(self._browse_ffmpeg)
+        ffmpeg_row = QHBoxLayout()
+        ffmpeg_row.addWidget(self.ffmpeg_dir, 1)
+        ffmpeg_row.addWidget(browse)
         form.addRow("", self.reopen_last)
         form.addRow(self._label("settings.language"), self.language)
         form.addRow(self._label("settings.default_filter"), self.default_filter)
         form.addRow("", self.read_metadata)
+        form.addRow(self._label("settings.ffmpeg_dir"), ffmpeg_row)
         layout.addWidget(group)
 
         logs, log_form = self._group("settings.logging")
@@ -377,6 +388,7 @@ class SettingsDialog(QDialog):
         _select(self.language, s.language)
         _select(self.default_filter, s.default_file_filter)
         self.read_metadata.setChecked(s.read_metadata)
+        self.ffmpeg_dir.setText(s.ffmpeg_dir)
         _select(self.log_level, s.log_level)
 
     def collect(self) -> AppSettings:
@@ -404,6 +416,7 @@ class SettingsDialog(QDialog):
             language=self.language.currentData(),
             default_file_filter=self.default_filter.currentData(),
             read_metadata=self.read_metadata.isChecked(),
+            ffmpeg_dir=self.ffmpeg_dir.text().strip(),
             log_level=self.log_level.currentData(),
         )
 
@@ -417,6 +430,11 @@ class SettingsDialog(QDialog):
         self.ctx.settings.save(self.collect())
         self.saved.emit()
         self.accept()
+
+    def _browse_ffmpeg(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, tr("settings.ffmpeg_dir"), self.ffmpeg_dir.text() or "")
+        if chosen:
+            self.ffmpeg_dir.setText(chosen)
 
     def _on_auto_apply_toggled(self, checked: bool) -> None:
         if not checked:
@@ -443,6 +461,8 @@ class SettingsDialog(QDialog):
         _relabel(self.theme, {t: tr(f"settings.theme_{t}") for t in ("system", "dark", "light")})
         _relabel(self.default_filter, {"video": tr("filter.video"), "all": tr("filter.all")})
         self.batch_size.setToolTip(tr("settings.batch_size_tip"))
+        self.ffmpeg_dir.setPlaceholderText(tr("settings.ffmpeg_auto"))
+        self.ffmpeg_dir.setToolTip(tr("settings.ffmpeg_dir_tip"))
         self.gemini_key.retranslate()
         self.openai_key.retranslate()
         self.buttons.button(QDialogButtonBox.StandardButton.Save).setText(tr("settings.save"))

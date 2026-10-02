@@ -315,4 +315,18 @@ STRINGS: dict[str, str] = {
     "prompt.default.youtube.text": "Rename each file to a clean YouTube-style title: Title Case, no underscores or dots, no resolution or codec tags. Keep the file extension.",
     # ---- crash
     "error.unexpected": "Something unexpected went wrong, but your files were not touched by this error.\n\n{error}\n\nDetails were written to the log folder:\n{logs}",
+    # ---- details / ffmpeg
+    "details.none": "Select a file to see its details",
+    "details.duration": "Duration",
+    "details.resolution": "Resolution",
+    "details.fps": "Frame rate",
+    "details.video": "Video codec",
+    "details.audio": "Audio codec",
+    "details.size": "File size",
+    "details.modified": "Modified",
+    "details.no_ffmpeg": "Install ffmpeg/ffprobe (or set its folder in Settings → General) to see durations, resolution and thumbnails.",
+    "settings.ffmpeg_dir": "ffmpeg / ffprobe folder",
+    "settings.ffmpeg_dir_tip": "Leave empty to use the bundled copy or the one on your PATH.",
+    "settings.ffmpeg_auto": "(automatic)",
+    "settings.browse": "Browse…",
 }

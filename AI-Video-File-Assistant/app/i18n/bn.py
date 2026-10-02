@@ -315,4 +315,18 @@ STRINGS: dict[str, str] = {
     "prompt.default.youtube.text": "প্রতিটি ফাইলের নাম পরিষ্কার YouTube-স্টাইল টাইটেলে বদলাও: Title Case, আন্ডারস্কোর বা ডট ছাড়া, রেজোলিউশন বা কোডেক ট্যাগ ছাড়া। ফাইলের এক্সটেনশন ঠিক রাখো।",
     # ---- crash
     "error.unexpected": "অপ্রত্যাশিত একটি সমস্যা হয়েছে, তবে এই ত্রুটিতে আপনার ফাইলে কোনো পরিবর্তন হয়নি।\n\n{error}\n\nবিস্তারিত লগ ফোল্ডারে লেখা হয়েছে:\n{logs}",
+    # ---- details / ffmpeg
+    "details.none": "বিস্তারিত দেখতে একটি ফাইল বেছে নিন",
+    "details.duration": "সময়কাল",
+    "details.resolution": "রেজোলিউশন",
+    "details.fps": "ফ্রেম রেট",
+    "details.video": "ভিডিও কোডেক",
+    "details.audio": "অডিও কোডেক",
+    "details.size": "ফাইলের আকার",
+    "details.modified": "পরিবর্তিত",
+    "details.no_ffmpeg": "সময়কাল, রেজোলিউশন ও থাম্বনেইল দেখতে ffmpeg/ffprobe ইনস্টল করুন (অথবা সেটিংস → সাধারণে এর ফোল্ডার দিন)।",
+    "settings.ffmpeg_dir": "ffmpeg / ffprobe ফোল্ডার",
+    "settings.ffmpeg_dir_tip": "খালি রাখলে সঙ্গে দেওয়া কপি বা PATH-এর কপি ব্যবহৃত হবে।",
+    "settings.ffmpeg_auto": "(স্বয়ংক্রিয়)",
+    "settings.browse": "ব্রাউজ…",
 }

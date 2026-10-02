@@ -61,6 +61,27 @@ class FileTableModel(QAbstractTableModel):
     def checked_count(self) -> int:
         return sum(1 for e in self._entries if e.checked)
 
+    # ---------------------------------------------------------------- sorting
+    def sort_by(self, column: int, descending: bool = False) -> None:
+        """Sort the rows in place with Python's native sort (fast even for tens of thousands of files).
+
+        ``QSortFilterProxyModel`` sorting calls back into Python for every comparison, which is ~1 s
+        per sort at 20 000 rows; sorting the source list directly takes a few milliseconds.
+        """
+        keys = {
+            COL_SELECT: lambda e: (not e.checked, e.natural_key),
+            COL_EXT: lambda e: (e.ext, e.natural_key),
+            COL_SIZE: lambda e: (e.size, e.natural_key),
+            COL_DURATION: lambda e: (e.duration or -1.0, e.natural_key),
+            COL_MODIFIED: lambda e: (e.mtime, e.natural_key),
+            COL_STATUS: lambda e: (e.status, e.natural_key),
+        }
+        key = keys.get(column, lambda e: e.natural_key)
+        self.beginResetModel()
+        self._entries.sort(key=key, reverse=descending)
+        self._row_by_path = {e.rel_path: i for i, e in enumerate(self._entries)}
+        self.endResetModel()
+
     # ----------------------------------------------------- check-state tools
     def set_checked_rows(self, rows: Iterable[int], checked: bool) -> None:
         """Set the check state of the given source rows (one signal for the whole span)."""
@@ -178,13 +199,13 @@ class FileTableModel(QAbstractTableModel):
 
 
 class FileFilterProxy(QSortFilterProxyModel):
-    """Filters by file kind and search text; sorts naturally (ep2 before ep10)."""
+    """Filters by file kind and search text. (Sorting is done by :meth:`FileTableModel.sort_by`.)"""
 
     def __init__(self) -> None:
         super().__init__()
         self._kinds: frozenset[FileKind] | None = None
         self._needle = ""
-        self.setDynamicSortFilter(False)  # re-sort only on demand: avoids churn during bulk edits
+        self.setDynamicSortFilter(False)  # never re-sort/re-filter implicitly during bulk edits
 
     def set_kinds(self, kinds: Iterable[FileKind] | None) -> None:
         self._kinds = None if kinds is None else frozenset(kinds)
@@ -194,7 +215,7 @@ class FileFilterProxy(QSortFilterProxyModel):
         self._needle = text.strip().casefold()
         self.invalidateFilter()
 
-    def filterAcceptsRow(self, source_row: int, source_parent: _Index) -> bool:
+    def filterAcceptsRow(self, source_row: int, source_parent: _Index) -> bool:  # noqa: N802
         model = self.sourceModel()
         if not isinstance(model, FileTableModel):
             return True
@@ -204,29 +225,6 @@ class FileFilterProxy(QSortFilterProxyModel):
         if self._kinds is not None and entry.kind not in self._kinds:
             return False
         return not self._needle or self._needle in entry.rel_path.casefold()
-
-    def lessThan(self, left: _Index, right: _Index) -> bool:
-        model = self.sourceModel()
-        if not isinstance(model, FileTableModel):
-            return False
-        a = model.entry_at(left.row())
-        b = model.entry_at(right.row())
-        if a is None or b is None:
-            return False
-        col = left.column()
-        if col == COL_SELECT:
-            return (not a.checked, a.natural_key) < (not b.checked, b.natural_key)  # checked rows first
-        if col == COL_EXT:
-            return (a.ext, a.natural_key) < (b.ext, b.natural_key)
-        if col == COL_SIZE:
-            return (a.size, a.natural_key) < (b.size, b.natural_key)
-        if col == COL_DURATION:
-            return (a.duration or -1.0, a.natural_key) < (b.duration or -1.0, b.natural_key)
-        if col == COL_MODIFIED:
-            return (a.mtime, a.natural_key) < (b.mtime, b.natural_key)
-        if col == COL_STATUS:
-            return (a.status, a.natural_key) < (b.status, b.natural_key)
-        return a.natural_key < b.natural_key
 
     def source_rows(self) -> list[int]:
         """Source-model rows currently visible, in display order."""

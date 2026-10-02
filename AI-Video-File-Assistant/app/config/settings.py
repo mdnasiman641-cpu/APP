@@ -66,6 +66,7 @@ class AppSettings:
     last_folder: str = ""
     log_level: str = "INFO"
     read_metadata: bool = True
+    ffmpeg_dir: str = ""
     default_file_filter: str = "video"
     # --- UI state
     window_geometry: str = ""

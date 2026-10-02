@@ -228,4 +228,10 @@ QLabel#Thumb {
     border-radius: 10px;
     color: @muted@;
 }
+QFrame#DetailsPane {
+    background: @surface_alt@;
+    border: 1px solid @border@;
+    border-radius: 10px;
+}
+QFrame#DetailsPane QLabel { background: transparent; }
 QLabel#DropHint { color: @muted@; font-size: 12px; }

@@ -34,6 +34,7 @@ from app.ui.file_table_model import (
     FileFilterProxy,
     FileTableModel,
 )
+from app.ui.details_panel import DetailsPanel
 from app.ui.widgets import Card, IconBinder, make_button
 
 # (translation key, kinds shown or None for all)
@@ -143,7 +144,7 @@ class FilesPanel(Card):
         self.table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(30)
-        self.table.setSortingEnabled(True)
+        self.table.setSortingEnabled(False)  # sorting is done by the model (see FileTableModel.sort_by)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.setMinimumHeight(150)
@@ -159,11 +160,19 @@ class FilesPanel(Card):
         self.table.setColumnWidth(COL_DURATION, 90)
         self.table.setColumnWidth(COL_MODIFIED, 140)
         self.table.setColumnWidth(COL_STATUS, 130)
-        header.sortIndicatorChanged.connect(self._on_header_sort)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.sectionClicked.connect(self._on_header_clicked)
         self.table.verticalScrollBar().valueChanged.connect(self._schedule_visible)
         self.table.selectionModel().currentRowChanged.connect(self._on_current_row)
-        self.table.sortByColumn(COL_NAME, Qt.SortOrder.AscendingOrder)
-        self.body.addWidget(self.table, 1)
+        self._sort_column, self._sort_desc = COL_NAME, False
+        header.setSortIndicator(COL_NAME, Qt.SortOrder.AscendingOrder)
+        self.details = DetailsPanel(self._icons)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addWidget(self.table, 1)
+        row.addWidget(self.details)
+        self.body.addLayout(row, 1)
 
     # ------------------------------------------------------------------- data
     def set_entries(self, entries: list[FileEntry], *, check_videos: bool = True) -> None:
@@ -172,7 +181,7 @@ class FilesPanel(Card):
             for entry in entries:
                 entry.checked = entry.kind == FileKind.VIDEO
         self.model.set_entries(entries)
-        self.proxy.sort(self.table.horizontalHeader().sortIndicatorSection(), self.table.horizontalHeader().sortIndicatorOrder())
+        self.model.sort_by(self._sort_column, self._sort_desc)
         self._update_count_label()
         self._emit_selection()
 
@@ -252,29 +261,31 @@ class FilesPanel(Card):
 
     def _on_sort_combo(self, *_args: object) -> None:
         column = SORT_COLUMNS[self.sort_combo.currentIndex()][1]
-        order = Qt.SortOrder.DescendingOrder if self.order_button.isChecked() else Qt.SortOrder.AscendingOrder
-        self._update_order_button()
-        self.table.sortByColumn(column, order)
+        self._sort(column, self.order_button.isChecked())
 
     def apply_sort(self, by: str, descending: bool) -> None:
         """Sort the table by ``by`` (``name``/``size``/``date``/``type``/``duration``), e.g. for a "sort" command."""
         columns = {"name": COL_NAME, "size": COL_SIZE, "date": COL_MODIFIED, "type": COL_EXT, "duration": COL_DURATION}
-        column = columns.get(by, COL_NAME)
-        index = next(i for i, (_, col) in enumerate(SORT_COLUMNS) if col == column)
+        self._sort(columns.get(by, COL_NAME), descending)
+
+    def _on_header_clicked(self, column: int) -> None:
+        if column == self._sort_column:
+            self._sort(column, not self._sort_desc)
+        else:
+            self._sort(column, False)
+
+    def _sort(self, column: int, descending: bool) -> None:
+        """Single entry point: sort the model, then bring the combo, arrow and header in line."""
+        self._sort_column, self._sort_desc = column, descending
+        self.model.sort_by(column, descending)
+        header = self.table.horizontalHeader()
+        header.setSortIndicator(column, Qt.SortOrder.DescendingOrder if descending else Qt.SortOrder.AscendingOrder)
+        index = next((i for i, (_, col) in enumerate(SORT_COLUMNS) if col == column), None)
         with _blocked(self.sort_combo, self.order_button):
-            self.sort_combo.setCurrentIndex(index)
+            if index is not None:
+                self.sort_combo.setCurrentIndex(index)
             self.order_button.setChecked(descending)
         self._update_order_button()
-        self.table.sortByColumn(column, Qt.SortOrder.DescendingOrder if descending else Qt.SortOrder.AscendingOrder)
-
-    def _on_header_sort(self, column: int, order: Qt.SortOrder) -> None:
-        for i, (_, col) in enumerate(SORT_COLUMNS):
-            if col == column:
-                with _blocked(self.sort_combo, self.order_button):
-                    self.sort_combo.setCurrentIndex(i)
-                    self.order_button.setChecked(order == Qt.SortOrder.DescendingOrder)
-                self._update_order_button()
-                break
         self._schedule_visible()
 
     def _update_order_button(self) -> None:
@@ -318,6 +329,7 @@ class FilesPanel(Card):
         self._update_count_label()
         self.selected_label.setText(tr("files.selected_count", count=self.model.checked_count()))
         self.model.retranslate()
+        self.details.retranslate()
 
 
 class _blocked:  # noqa: N801 - tiny context manager

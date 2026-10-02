@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QObject, Qt, QThreadPool, QUrl
+from PySide6.QtCore import QByteArray, QEvent, QObject, Qt, QThreadPool, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,9 +29,11 @@ from app.ai.pipeline import PipelineRequest, PipelineResult
 from app.config.constants import APP_NAME, FileKind
 from app.context import AppContext
 from app.database.models import CommandRecord, SavedPrompt
+from app.files.metadata import MetadataProbe, VideoMetadata
 from app.files.operation_manager import ExecutionResult, OperationManager, UndoResult
 from app.files.plan import OpKind, Plan
-from app.files.scanner import ScanResult
+from app.files.scanner import FileEntry, ScanResult
+from app.files.thumbnails import ThumbnailCache
 from app.i18n import set_language, tr
 from app.ui.command_panel import CommandPanel
 from app.ui.files_panel import FilesPanel
@@ -45,6 +47,7 @@ from app.utils.helpers import classify_extension, resource_path
 from app.utils.logger import get_logger, setup_logging
 from app.workers.ai_worker import PlanWorker
 from app.workers.base_worker import BaseWorker
+from app.workers.metadata_worker import MetadataWorker, ThumbnailWorker, media_pool
 from app.workers.operation_worker import OperationWorker, UndoWorker
 from app.workers.scan_worker import ScanWorker
 
@@ -69,6 +72,15 @@ class MainWindow(QMainWindow):
         self._operation_running = False
         self._pending_paths: set[str] = set()  # relative paths to tick after the next scan
         self._pending_statuses: dict[str, str] = {}
+        self._probe = MetadataProbe(self.settings.ffmpeg_dir)
+        self._thumbs = ThumbnailCache(self.settings.ffmpeg_dir)
+        self._meta: dict[str, VideoMetadata | None] = {}
+        self._meta_requested: set[str] = set()
+        self._meta_generation = 0
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.setInterval(250)
+        self._thumb_timer.timeout.connect(self._request_thumbnail)
         self._sticky_status: tuple[str, str] | None = None  # shown after the next scan instead of the file count
         self._plan_worker: PlanWorker | None = None
         self._active_command = ""
@@ -117,6 +129,9 @@ class MainWindow(QMainWindow):
         self.splitter.setChildrenCollapsible(False)
         self.files_panel = FilesPanel(self._icons)
         self.files_panel.selection_changed.connect(self._on_selection_changed)
+        self.files_panel.visible_rows_changed.connect(self._request_visible_metadata)
+        self.files_panel.current_entry_changed.connect(self._on_current_entry)
+        self.files_panel.details.set_capabilities(probe=self._probe.available, ffmpeg=self._thumbs.available)
         self.command_panel = CommandPanel(self._icons)
         self.command_panel.generate_requested.connect(self.generate_preview)
         self.command_panel.cancel_requested.connect(self.cancel_planning)
@@ -322,6 +337,7 @@ class MainWindow(QMainWindow):
     def _on_scan_done(self, generation: int, result: ScanResult) -> None:
         if generation != self._scan_generation:
             return  # a newer scan superseded this one
+        self._reset_metadata()
         self.files_panel.set_entries(result.entries)
         if self._pending_paths:
             wanted, self._pending_paths = self._pending_paths, set()
@@ -351,6 +367,80 @@ class MainWindow(QMainWindow):
 
     def _on_selection_changed(self, count: int) -> None:
         """Hook: the selection changed (the preview is only re-generated on request)."""
+
+    # ===================================================== metadata / thumbnails
+    def _reset_metadata(self) -> None:
+        """A new scan invalidates everything learned about the previous file list."""
+        self._meta_generation += 1
+        self._meta.clear()
+        self._meta_requested.clear()
+        self.files_panel.details.show_entry(None, None)
+
+    def _request_visible_metadata(self) -> None:
+        """Lazily probe only the rows that are on screen (ffprobe reads headers, never full videos)."""
+        if not self.settings.read_metadata or not self._probe.available or self.workspace is None:
+            return
+        wanted: list[FileEntry] = [
+            e for e in self.files_panel.visible_viewport_entries()
+            if e.kind in (FileKind.VIDEO, FileKind.AUDIO) and e.rel_path not in self._meta_requested
+        ][:60]  # fmt: skip
+        if not wanted:
+            return
+        self._meta_requested.update(e.rel_path for e in wanted)
+        generation = self._meta_generation
+        worker = MetadataWorker(self.workspace, wanted, self._probe, self.ctx.db)
+        worker.signals.item.connect(lambda rel, meta: self._on_metadata_item(generation, rel, meta))  # type: ignore[attr-defined]
+        self._workers.add(worker)
+        worker.signals.finished.connect(lambda: self._workers.discard(worker))
+        media_pool().start(worker)
+
+    def _on_metadata_item(self, generation: int, rel_path: str, meta: object) -> None:
+        if generation != self._meta_generation:
+            return
+        value = meta if isinstance(meta, VideoMetadata) else None
+        self._meta[rel_path] = value
+        self.files_panel.model.set_duration(rel_path, value.duration if value else None)
+        details = self.files_panel.details
+        if details.current_rel_path == rel_path:
+            entry = self.files_panel.model.entry_for_path(rel_path)
+            details.show_entry(entry, value)
+            self._thumb_timer.start()
+
+    def _on_current_entry(self, entry: object) -> None:
+        details = self.files_panel.details
+        if not isinstance(entry, FileEntry):
+            details.show_entry(None, None)
+            return
+        details.show_entry(entry, self._meta.get(entry.rel_path))
+        if entry.kind == FileKind.VIDEO:
+            self._thumb_timer.start()  # debounced: arrowing through rows must not spawn ffmpeg per row
+        if (
+            self.settings.read_metadata and self._probe.available and entry.rel_path not in self._meta_requested
+            and entry.kind in (FileKind.VIDEO, FileKind.AUDIO)
+        ):  # fmt: skip
+            self._request_visible_metadata()
+
+    def _request_thumbnail(self) -> None:
+        details = self.files_panel.details
+        rel = details.current_rel_path
+        entry = self.files_panel.model.entry_for_path(rel) if rel else None
+        if entry is None or self.workspace is None or entry.kind != FileKind.VIDEO or not self._thumbs.available:
+            return
+        cached = self._thumbs.cached(entry.absolute(self.workspace))
+        if cached is not None:
+            details.set_thumbnail(str(cached))
+            return
+        generation = self._meta_generation
+        worker = ThumbnailWorker(self.workspace, entry, self._thumbs)
+        worker.signals.thumbnail.connect(lambda r, path: self._on_thumbnail(generation, r, path))  # type: ignore[attr-defined]
+        self._workers.add(worker)
+        worker.signals.finished.connect(lambda: self._workers.discard(worker))
+        media_pool().start(worker)
+
+    def _on_thumbnail(self, generation: int, rel_path: str, image_path: str) -> None:
+        details = self.files_panel.details
+        if generation == self._meta_generation and details.current_rel_path == rel_path and image_path:
+            details.set_thumbnail(image_path)
 
     # ============================================================ prompt/history
     def refresh_prompt_menus(self) -> None:
@@ -714,6 +804,12 @@ class MainWindow(QMainWindow):
             self.subfolders_check.setChecked(self.settings.include_subfolders)  # triggers a rescan
         if self.settings.default_provider != previous.default_provider:
             self.command_panel.set_provider(self.settings.default_provider)
+        if (self.settings.ffmpeg_dir, self.settings.read_metadata) != (previous.ffmpeg_dir, previous.read_metadata):
+            self._probe = MetadataProbe(self.settings.ffmpeg_dir)
+            self._thumbs = ThumbnailCache(self.settings.ffmpeg_dir)
+            self.files_panel.details.set_capabilities(probe=self._probe.available, ffmpeg=self._thumbs.available)
+            self._meta_requested.clear()
+            self._request_visible_metadata()
         self.show_status(tr("status.settings_saved"), "success")
 
     # ============================================================== drag & drop
@@ -783,6 +879,7 @@ class MainWindow(QMainWindow):
         for worker in list(self._workers):
             worker.cancel()
         self._pool.waitForDone(5000)
+        media_pool().waitForDone(3000)
         try:
             geometry = bytes(self.saveGeometry().toBase64().data()).decode("ascii")
             self.ctx.settings.update(window_geometry=geometry)

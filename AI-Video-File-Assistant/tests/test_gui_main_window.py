@@ -170,3 +170,31 @@ def test_light_theme_applies(qapp):
 
 def test_filekind_enum_values():
     assert FileKind.VIDEO.value == "video"
+
+
+def test_header_click_toggles_sort_and_stays_in_sync(window, workspace):
+    from app.ui.file_table_model import COL_SIZE
+
+    (workspace / "small.mp4").write_bytes(b"1")
+    (workspace / "big.mp4").write_bytes(b"1" * 500)
+    window.load_folder(workspace)
+    panel = window.files_panel
+    assert wait_until(lambda: panel.model.rowCount() == 2)
+    header = panel.table.horizontalHeader()
+    header.sectionClicked.emit(COL_SIZE)  # first click: ascending
+    assert [panel.proxy.index(r, 1).data() for r in range(2)] == ["small.mp4", "big.mp4"]
+    assert panel.sort_combo.currentIndex() == 1 and not panel.order_button.isChecked()
+    header.sectionClicked.emit(COL_SIZE)  # second click: descending
+    assert [panel.proxy.index(r, 1).data() for r in range(2)] == ["big.mp4", "small.mp4"]
+    assert panel.order_button.isChecked() and panel.order_button.text() == "▼"
+
+
+def test_sort_survives_a_rescan(window, workspace):
+    (workspace / "a.mp4").write_bytes(b"1")
+    (workspace / "b.mp4").write_bytes(b"1" * 9)
+    window.load_folder(workspace)
+    panel = window.files_panel
+    assert wait_until(lambda: panel.model.rowCount() == 2)
+    panel.apply_sort("size", True)
+    window.refresh()
+    assert wait_until(lambda: [panel.proxy.index(r, 1).data() for r in range(2)] == ["b.mp4", "a.mp4"])
