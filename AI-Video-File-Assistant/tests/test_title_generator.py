@@ -440,7 +440,7 @@ def test_network_and_timeout_errors(google):
 
     with pytest.raises(SearchError) as err:
         dead.search("q", 3)
-    assert err.value.kind == "network"
+    assert err.value.kind in ("network", "timeout")  # Windows waits out a closed port instead of refusing at once
     google.queue(200, EPISODE, delay=1.5)
     slow = SearchService(GoogleSearchClient("k", "cx", google.base, timeout=0.3))
     with pytest.raises(SearchError) as err2:
