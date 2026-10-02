@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -83,7 +84,7 @@ def test_probe_is_unavailable_without_binary(monkeypatch):
 
 
 def test_find_binary_prefers_configured_folder(tmp_path):
-    fake = tmp_path / "ffprobe"
+    fake = tmp_path / ("ffprobe.exe" if os.name == "nt" else "ffprobe")  # Windows looks for the .exe
     fake.write_text("#!/bin/sh\n")
     assert md.find_binary("ffprobe", str(tmp_path)) == fake
 
