@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -34,7 +35,9 @@ from app.files.scanner import ScanResult
 from app.i18n import set_language, tr
 from app.ui.command_panel import CommandPanel
 from app.ui.files_panel import FilesPanel
+from app.ui.history_window import HistoryDialog
 from app.ui.preview_window import PreviewPanel
+from app.ui.saved_prompts_window import SavedPromptsDialog
 from app.ui.settings_window import SettingsDialog
 from app.ui.theme import PALETTES, apply_theme, resolve_theme
 from app.ui.widgets import Card, IconBinder, Retranslator, make_button
@@ -118,6 +121,8 @@ class MainWindow(QMainWindow):
         self.command_panel.generate_requested.connect(self.generate_preview)
         self.command_panel.cancel_requested.connect(self.cancel_planning)
         self.command_panel.saved_prompt_chosen.connect(self._use_saved_prompt)
+        self.command_panel.manage_prompts_requested.connect(self.open_prompts)
+        self.command_panel.save_prompt_requested.connect(self.save_current_as_prompt)
         self.command_panel.recent_command_chosen.connect(self._use_recent_command)
         self.preview_panel = PreviewPanel(self._icons)
         self.preview_panel.set_palette(self._palette)
@@ -132,6 +137,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.splitter, 1)
 
         self._build_status_bar()
+        self.add_header_button("prompts", "star", "header.prompts", "header.prompts_tip", self.open_prompts)
+        self.add_header_button("history", "history", "header.history", "header.history_tip", self.open_history)
         self.add_header_button("undo", "undo", "header.undo", "header.undo_tip", self.undo_last)
         self.add_header_button("settings", "settings", "header.settings", "header.settings_tip", self.open_settings)
 
@@ -357,6 +364,40 @@ class MainWindow(QMainWindow):
     def _use_recent_command(self, record: CommandRecord) -> None:
         self.command_panel.set_command(record.command)
         self.command_panel.set_provider(record.provider)
+
+    def open_prompts(self, prefill: tuple[str, str] | None = None) -> None:
+        """Saved Prompts / Command History dialog (``Use`` copies a command into the box)."""
+        dialog = SavedPromptsDialog(self.ctx, self, prefill=prefill if isinstance(prefill, tuple) else None)
+        dialog.use_requested.connect(self._on_prompt_used)
+        dialog.changed.connect(self.refresh_prompt_menus)
+        dialog.exec()
+        dialog.deleteLater()
+        self.refresh_prompt_menus()
+
+    def _on_prompt_used(self, text: str, provider: str) -> None:
+        self.command_panel.set_command(text)
+        self.command_panel.set_provider(provider)
+
+    def save_current_as_prompt(self) -> None:
+        """Quick-save the command in the box as a Saved Prompt (asks only for a name)."""
+        command = self.command_panel.command()
+        if not command:
+            self.show_status(tr("pipeline.no_command"), "warning")
+            return
+        default_name = command.splitlines()[0][:40]
+        name, ok = QInputDialog.getText(self, tr("prompts.title"), tr("command.prompt_name"), text=default_name)
+        if ok and name.strip():
+            self.ctx.db.add_saved_prompt(name.strip(), command, self.command_panel.provider().value)
+            self.refresh_prompt_menus()
+            self.show_status(tr("status.prompt_saved", name=name.strip()), "success")
+
+    def open_history(self) -> None:
+        """Operation history with Undo."""
+        dialog = HistoryDialog(self.ctx, self)
+        dialog.undo_requested.connect(self.undo_operation)
+        dialog.exec()
+        dialog.deleteLater()
+        self.refresh_undo_button()
 
     # ================================================================== preview
     def generate_preview(self) -> None:

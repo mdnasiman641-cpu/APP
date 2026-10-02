@@ -510,3 +510,52 @@ def test_unicode_and_bangla_roundtrip(workspace, make_files, mgr):
 def test_status_enum_helpers():
     assert OpStatus.OK.applicable and OpStatus.WARNING.applicable
     assert not OpStatus.CONFLICT.applicable and not OpStatus.INVALID.applicable
+
+
+# ---------------------------------------------------- spec: error situations
+def test_workspace_deleted_after_preview_is_reported_cleanly(workspace, make_files, mgr):
+    import shutil
+
+    make_files("a.mp4")
+    plan = plan_for(workspace, [RenameAction("a.mp4", "b.mp4")])
+    shutil.rmtree(workspace)
+    result = mgr.execute(plan)
+    assert not result.ok and "folder changed" in result.message  # no crash, no traceback
+
+
+def test_workspace_deleted_makes_undo_impossible_with_explanation(workspace, make_files, mgr):
+    import shutil
+
+    make_files("a.mp4")
+    result = mgr.execute(plan_for(workspace, [RenameAction("a.mp4", "b.mp4")]))
+    shutil.rmtree(workspace)
+    outcome = mgr.undo(result.operation_id)
+    assert not outcome.ok and "no longer exists" in outcome.blockers[0]
+
+
+def test_read_only_target_folder_gives_permission_message(workspace, make_files, mgr):
+    if os.name == "nt" or os.geteuid() == 0:
+        pytest.skip("permission bits are not enforced for this user/platform")
+    make_files("a.mp4")
+    (workspace / "Locked").mkdir()
+    os.chmod(workspace / "Locked", 0o500)
+    try:
+        result = mgr.execute(plan_for(workspace, [MoveAction(source="a.mp4", target_folder="Locked")]))
+    finally:
+        os.chmod(workspace / "Locked", 0o700)
+    assert not result.ok and "Permission denied" in result.message and (workspace / "a.mp4").exists()
+
+
+def test_sharing_violation_style_error_is_friendly(workspace, make_files, mgr, monkeypatch):
+    make_files("a.mp4")
+    real = os.rename
+
+    def locked(src, dst, *a, **k):
+        err = PermissionError(13, "The process cannot access the file because it is being used by another process")
+        err.winerror = 32  # what Windows reports for a locked file
+        raise err
+
+    monkeypatch.setattr(os, "rename", locked)
+    result = mgr.execute(plan_for(workspace, [RenameAction("a.mp4", "b.mp4")]))
+    monkeypatch.setattr(os, "rename", real)
+    assert not result.ok and "locked" in result.message and (workspace / "a.mp4").exists()

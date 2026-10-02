@@ -13,6 +13,7 @@ def main(argv: list[str] | None = None) -> int:
     from app.config.constants import APP_NAME, APP_ORGANIZATION
     from app.context import AppContext
     from app.i18n import set_language
+    from app.ui.error_hook import install_exception_hooks
     from app.ui.gc_guard import MainThreadGC
     from app.ui.main_window import MainWindow
     from app.ui.theme import apply_theme
@@ -32,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     ctx = AppContext.create()
     settings = ctx.settings.load()
     setup_logging(settings.log_level)
+    install_exception_hooks()
     set_language(settings.language)
     apply_theme(app, settings.theme)
     get_logger("app").info("Startup complete (theme=%s, language=%s)", settings.theme, settings.language)
