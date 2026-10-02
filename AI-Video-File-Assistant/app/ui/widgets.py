@@ -18,6 +18,28 @@ from PySide6.QtWidgets import (
 )
 
 from app.i18n import tr
+from app.ui.icons import get_icon
+
+
+class IconBinder:
+    """Keeps icons tinted correctly across theme changes.
+
+    ``bind(setter, name)`` paints the icon in the current muted colour (or a fixed
+    ``color``); :meth:`refresh` repaints every bound icon after the theme changes.
+    """
+
+    def __init__(self, color: str) -> None:
+        self.color = color
+        self._items: list[tuple[Callable[[QIcon], None], str, int, str | None]] = []
+
+    def bind(self, setter: Callable[[QIcon], None], name: str, size: int = 16, color: str | None = None) -> None:
+        self._items.append((setter, name, size, color))
+        setter(get_icon(name, color or self.color, size))
+
+    def refresh(self, color: str) -> None:
+        self.color = color
+        for setter, name, size, fixed in self._items:
+            setter(get_icon(name, fixed or color, size))
 
 
 class Retranslator:
@@ -80,18 +102,23 @@ def make_button(
     text_key: str | None,
     retranslator: Retranslator,
     *,
-    icon: QIcon | None = None,
+    icon: str | None = None,
+    binder: IconBinder | None = None,
+    icon_color: str | None = None,
     name: str | None = None,
     tooltip_key: str | None = None,
     icon_size: int = 16,
 ) -> QPushButton:
-    """Create a translatable button; ``name`` selects a QSS style (``Primary``, ``Danger``...)."""
+    """Create a translatable button; ``name`` selects a QSS style (``Primary``, ``Danger``...).
+
+    ``icon`` is an icon name from ``resources/icons``; with a ``binder`` it re-tints on theme change.
+    """
     button = QPushButton()
     if name:
         button.setObjectName(name)
-    if icon is not None:
-        button.setIcon(icon)
+    if icon is not None and binder is not None:
         button.setIconSize(QSize(icon_size, icon_size))
+        binder.bind(button.setIcon, icon, icon_size, icon_color)
     if text_key:
         retranslator.text(button, text_key)
     if tooltip_key:

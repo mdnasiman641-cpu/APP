@@ -20,11 +20,24 @@ def window(qapp, tmp_path, dispose):
     apply_theme(qapp, "dark")
     ctx = AppContext.create(tmp_path / "ctx")
     win = MainWindow(ctx)
+    win.files_panel.set_filter("all")  # tests assume every file is visible unless they say otherwise
     win.show()
     yield win
     wait_until(lambda: not win._workers, timeout=3)  # let in-flight workers finish first
     dispose(win)
     set_language("en")
+
+
+def test_default_filter_shows_videos_only(qapp, tmp_path, dispose, make_files, workspace):
+    make_files("a.mp4", "notes.txt")
+    win = MainWindow(AppContext.create(tmp_path / "ctx2"))
+    win.show()
+    win.load_folder(workspace)
+    assert wait_until(lambda: win.files_panel.model.rowCount() == 2)
+    assert win.files_panel.proxy.rowCount() == 1  # only the video is listed by default
+    assert "1 of 2" in win.files_panel.count_label.text()
+    wait_until(lambda: not win._workers, timeout=3)
+    dispose(win)
 
 
 def test_window_title_and_defaults(window):

@@ -28,11 +28,12 @@ from app.context import AppContext
 from app.files.scanner import ScanResult
 from app.i18n import tr
 from app.ui.files_panel import FilesPanel
-from app.ui.icons import get_icon
-from app.ui.theme import PALETTES, resolve_theme
-from app.ui.widgets import Card, Retranslator, make_button
+from app.i18n import set_language
+from app.ui.settings_window import SettingsDialog
+from app.ui.theme import PALETTES, apply_theme, resolve_theme
+from app.ui.widgets import Card, IconBinder, Retranslator, make_button
 from app.utils.helpers import resource_path
-from app.utils.logger import get_logger
+from app.utils.logger import get_logger, setup_logging
 from app.workers.base_worker import BaseWorker
 from app.workers.scan_worker import ScanWorker
 
@@ -54,6 +55,7 @@ class MainWindow(QMainWindow):
         self._busy = 0
         self._pending_check: set[str] = set()
         self._icon_color = PALETTES[resolve_theme(self.settings.theme)]["muted"]
+        self._icons = IconBinder(self._icon_color)
 
         self._tr.title(self, "app.title")
         self.setMinimumSize(900, 640)
@@ -66,6 +68,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._restore_geometry()
         QApplication.instance().installEventFilter(self)  # type: ignore[union-attr]
+        self.files_panel.set_filter(self.settings.default_file_filter)
         self.show_status(tr("status.ready"))
         if self.settings.reopen_last_folder and self.settings.last_folder:
             if Path(self.settings.last_folder).is_dir():
@@ -86,12 +89,13 @@ class MainWindow(QMainWindow):
 
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.setChildrenCollapsible(False)
-        self.files_panel = FilesPanel(self._icon_color)
+        self.files_panel = FilesPanel(self._icons)
         self.files_panel.selection_changed.connect(self._on_selection_changed)
         self.splitter.addWidget(self.files_panel)
         layout.addWidget(self.splitter, 1)
 
         self._build_status_bar()
+        self.add_header_button("settings", "settings", "header.settings", "header.settings_tip", self.open_settings)
 
     def _build_header(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -108,7 +112,7 @@ class MainWindow(QMainWindow):
     def add_header_button(self, key: str, icon_name: str, text_key: str, tip_key: str, handler: Callable[[], None]) -> None:
         """Add a button to the top-right of the header (used for Prompts / History / Settings)."""
         button = make_button(
-            text_key, self._tr, icon=get_icon(icon_name, self._icon_color, 18), name="HeaderButton", tooltip_key=tip_key
+            text_key, self._tr, icon=icon_name, binder=self._icons, name="HeaderButton", tooltip_key=tip_key, icon_size=18
         )
         button.clicked.connect(handler)
         self.header_buttons[key] = button
@@ -125,13 +129,12 @@ class MainWindow(QMainWindow):
         self.folder_edit.returnPressed.connect(self._on_folder_entered)
         row.addWidget(self.folder_edit, 1)
         self.browse_button = make_button(
-            "folder.browse", self._tr, icon=get_icon("folder", "#ffffff", 16), name="Primary", tooltip_key="folder.browse_tip"
-        )
+            "folder.browse", self._tr, icon="folder", binder=self._icons, icon_color="#ffffff", name="Primary",
+            tooltip_key="folder.browse_tip",
+        )  # fmt: skip
         self.browse_button.clicked.connect(self.browse_folder)
         row.addWidget(self.browse_button)
-        self.refresh_button = make_button(
-            "folder.refresh", self._tr, icon=get_icon("refresh", self._icon_color, 16), tooltip_key="folder.refresh_tip"
-        )
+        self.refresh_button = make_button("folder.refresh", self._tr, icon="refresh", binder=self._icons, tooltip_key="folder.refresh_tip")
         self.refresh_button.clicked.connect(self.refresh)
         row.addWidget(self.refresh_button)
         card.body.addLayout(row)
@@ -299,6 +302,34 @@ class MainWindow(QMainWindow):
         self.settings = self.ctx.settings.load()
         if self.workspace is not None:
             self.refresh()
+
+    # --------------------------------------------------------------- settings
+    def open_settings(self) -> None:
+        """Show the Settings dialog and apply whatever the user changed."""
+        dialog = SettingsDialog(self.ctx, self, self._icon_color)
+        dialog.saved.connect(self._on_settings_saved)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def _on_settings_saved(self) -> None:
+        previous = self.settings
+        self.settings = self.ctx.settings.load()
+        if self.settings.language != previous.language:
+            set_language(self.settings.language)
+            self.retranslate()
+        if self.settings.theme != previous.theme:
+            apply_theme(QApplication.instance(), self.settings.theme)  # type: ignore[arg-type]
+            self._icon_color = PALETTES[resolve_theme(self.settings.theme)]["muted"]
+            self._icons.refresh(self._icon_color)
+        if self.settings.log_level != previous.log_level:
+            setup_logging(self.settings.log_level)
+        if self.settings.include_subfolders != previous.include_subfolders:
+            self.subfolders_check.setChecked(self.settings.include_subfolders)  # triggers a rescan
+        self.on_settings_changed(previous)
+        self.show_status(tr("status.settings_saved"), "success")
+
+    def on_settings_changed(self, previous: object) -> None:
+        """Hook for panels that depend on settings (provider default etc.)."""
 
     def _on_selection_changed(self, count: int) -> None:
         """Hook for later phases (enables/disables command controls)."""

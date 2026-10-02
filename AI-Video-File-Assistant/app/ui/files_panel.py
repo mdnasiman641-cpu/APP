@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from PySide6.QtCore import QModelIndex, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -33,8 +34,7 @@ from app.ui.file_table_model import (
     FileFilterProxy,
     FileTableModel,
 )
-from app.ui.icons import get_icon
-from app.ui.widgets import Card, make_button
+from app.ui.widgets import Card, IconBinder, make_button
 
 # (translation key, kinds shown or None for all)
 FILTERS: tuple[tuple[str, tuple[FileKind, ...] | None], ...] = (
@@ -61,9 +61,9 @@ class FilesPanel(Card):
     current_entry_changed = Signal(object)  # FileEntry | None
     visible_rows_changed = Signal()  # debounced: scrolled / filtered / resized
 
-    def __init__(self, icon_color: str = "#98a0b3") -> None:
+    def __init__(self, icons: IconBinder) -> None:
         super().__init__("files.title")
-        self._icon_color = icon_color
+        self._icons = icons
         self.model = FileTableModel()
         self.proxy = FileFilterProxy()
         self.proxy.setSourceModel(self.model)
@@ -90,7 +90,8 @@ class FilesPanel(Card):
         row.setSpacing(8)
         self.search = QLineEdit()
         self.search.setClearButtonEnabled(True)
-        self.search.addAction(get_icon("search", self._icon_color, 16), QLineEdit.ActionPosition.LeadingPosition)
+        search_action = self.search.addAction(QIcon(), QLineEdit.ActionPosition.LeadingPosition)
+        self._icons.bind(search_action.setIcon, "search", 16)
         self.search.textChanged.connect(self._on_search)
         self.search.setMinimumWidth(180)
         row.addWidget(self.search, 1)
@@ -306,9 +307,6 @@ class FilesPanel(Card):
         self._update_count_label()
         self.selected_label.setText(tr("files.selected_count", count=self.model.checked_count()))
         self.model.retranslate()
-
-    def set_icon_color(self, color: str) -> None:
-        self._icon_color = color
 
 
 class _blocked:  # noqa: N801 - tiny context manager
