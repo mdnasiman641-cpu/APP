@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -91,7 +92,7 @@ def test_keyfile_backend_roundtrip_and_permissions(tmp_path):
     blob = backend.protect(b"hello secret")
     assert b"hello secret" not in blob and backend.unprotect(blob) == b"hello secret"
     assert backend.protect(b"hello secret") != blob  # random nonce
-    if hasattr(Path, "stat"):
+    if os.name != "nt":  # POSIX permission bits do not apply on Windows (where DPAPI is used instead)
         assert (tmp_path / "k" / "secret.key").stat().st_mode & 0o077 == 0
 
 
