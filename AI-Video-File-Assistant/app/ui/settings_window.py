@@ -34,7 +34,8 @@ from PySide6.QtWidgets import (
 )
 
 from app.ai.base_provider import ConnectionResult
-from app.ai.model_config import PROVIDER_TYPES, ModelConfig
+from app.ai.model_config import PROVIDER_TYPES, ModelConfig, validate_base_url
+from app.ai.web_search import SECRET_NAME as SEARCH_SECRET
 from app.config.backup import BackupError, export_settings, import_settings
 from app.config.constants import MAX_BATCH_SIZE
 from app.config.settings import AppSettings
@@ -44,6 +45,7 @@ from app.ui.model_choice import AUTO, fill_model_combo, fill_strategy_combo
 from app.ui.model_dialog import CAPABILITY_KEYS, ModelDialog, ModelPickerDialog
 from app.ui.widgets import Retranslator, confirm_destructive
 from app.utils.logger import get_log_dir
+from app.utils.security import mask_key
 from app.workers.ai_worker import ConnectionTestWorker
 from app.workers.base_worker import BaseWorker
 
@@ -178,6 +180,7 @@ class SettingsDialog(QDialog):
         form.addRow("", self.use_offline)
         form.addRow("", self.send_metadata)
         layout.addWidget(requests)
+        layout.addWidget(self._build_search_group())
 
         self.advanced_toggle = QToolButton()
         self.advanced_toggle.setCheckable(True)
@@ -220,6 +223,54 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.advanced)
         layout.addStretch(1)
         return page
+
+    def _build_search_group(self) -> QGroupBox:
+        """Google Programmable Search for the Title Generator (key encrypted like the model keys)."""
+        group, form = self._group("settings.google_search")
+        self.search_key_status = QLabel()
+        self.search_key_input = QLineEdit()
+        self.search_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.search_key_input.setAcceptDrops(False)
+        self._tr.placeholder(self.search_key_input, "settings.search_key_placeholder")
+        self.search_key_remove = self._button("settings.remove_key", self.remove_search_key)
+        self.search_key_remove.setObjectName("Danger")
+        key_row = QHBoxLayout()
+        key_row.addWidget(self.search_key_input, 1)
+        key_row.addWidget(self.search_key_remove)
+        self.search_engine_id = QLineEdit()
+        self.search_engine_id.setMaxLength(120)
+        self._tr.placeholder(self.search_engine_id, "settings.search_engine_placeholder")
+        self.search_endpoint = QLineEdit()
+        self.search_cache_hours = self._spin(0, 720, " h")
+        clear = self._button("tg.clear_cache", self.clear_search_cache)
+        cache_row = QHBoxLayout()
+        cache_row.addWidget(self.search_cache_hours)
+        cache_row.addWidget(clear)
+        cache_row.addStretch(1)
+        form.addRow(self._label("settings.api_key"), self.search_key_status)
+        form.addRow("", key_row)
+        form.addRow(self._label("settings.search_engine_id"), self.search_engine_id)
+        form.addRow(self._label("settings.search_endpoint"), self.search_endpoint)
+        form.addRow(self._label("settings.search_cache"), cache_row)
+        form.addRow("", self._hint("settings.search_note"))
+        self._refresh_search_key()
+        return group
+
+    def _refresh_search_key(self) -> None:
+        masked = mask_key(self.ctx.settings.secrets.get(SEARCH_SECRET))
+        self.search_key_status.setText(tr("settings.key_saved", masked=masked) if masked else tr("settings.key_none"))
+        self.search_key_remove.setEnabled(bool(masked))
+
+    def remove_search_key(self) -> None:
+        if confirm_destructive(self, tr("models.remove_key_confirm"), tr("models.remove")):
+            self.ctx.settings.secrets.delete(SEARCH_SECRET)
+            self.search_key_input.clear()
+            self._refresh_search_key()
+
+    def clear_search_cache(self) -> int:
+        removed = self.ctx.db.purge_search_cache(None)
+        self._set_result(tr("tg.cache_cleared", count=removed), "Success")
+        return removed
 
     def _toggle_advanced(self, shown: bool) -> None:
         self.advanced.setVisible(shown)
@@ -556,6 +607,9 @@ class SettingsDialog(QDialog):
 
     # ------------------------------------------------------------- load / save
     def _load(self, s: AppSettings) -> None:
+        self.search_engine_id.setText(s.search_engine_id)
+        self.search_endpoint.setText(s.search_endpoint)
+        self.search_cache_hours.setValue(s.search_cache_hours)
         fill_strategy_combo(self.strategy, s.routing_strategy)
         fill_model_combo(self.preferred_model, self.ctx.registry, s.preferred_model_id or AUTO)
         self._update_strategy_hint()
@@ -605,6 +659,9 @@ class SettingsDialog(QDialog):
             cooldown_after_failures=self.cooldown_after.value(),
             max_request_chars=self.max_chars.value(),
             health_tracking=self.health_tracking.isChecked(),
+            search_engine_id=self.search_engine_id.text().strip(),
+            search_endpoint=self.search_endpoint.text().strip(),
+            search_cache_hours=self.search_cache_hours.value(),
             ask_before_apply=self.ask_before.isChecked(),
             create_history=self.create_history.isChecked(),
             prevent_overwrite=self.prevent_overwrite.isChecked(),
@@ -623,6 +680,15 @@ class SettingsDialog(QDialog):
 
     def save(self) -> None:
         """Persist the settings (models were already saved by the model form), then close."""
+        problem = validate_base_url(self.search_endpoint.text().strip()) if self.search_endpoint.text().strip() else None
+        if problem:
+            self._set_result("✗ " + tr("settings.search_endpoint") + ": " + problem, "Danger")
+            self.tabs.setCurrentIndex(0)
+            return
+        key = self.search_key_input.text().strip()
+        if key:  # explicit Save for the sensitive value; an empty field never removes the saved key
+            self.ctx.settings.secrets.set(SEARCH_SECRET, key)
+            self.search_key_input.clear()
         saved = self.ctx.settings.save(self.collect())
         self.ctx.health.configure(
             cooldown_s=saved.cooldown_seconds, cooldown_after_failures=saved.cooldown_after_failures,

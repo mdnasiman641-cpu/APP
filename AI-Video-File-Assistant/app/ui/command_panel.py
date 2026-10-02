@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
@@ -23,6 +25,7 @@ from app.ui.model_choice import (
     fill_strategy_combo,
     resolve_model_choice,
 )
+from app.ui.title_panel import TitlePanel
 from app.ui.widgets import Card, IconBinder, make_button
 from app.utils.helpers import truncate
 
@@ -50,7 +53,7 @@ class CommandPanel(Card):
     save_prompt_requested = Signal()
     routing_changed = Signal()  # AI mode or model changed by the user (auto-saved by the main window)
 
-    def __init__(self, icons: IconBinder, registry: ModelRegistry | None = None) -> None:
+    def __init__(self, icons: IconBinder, registry: ModelRegistry | None = None, db: Any | None = None) -> None:
         super().__init__("command.title")
         self._icons = icons
         self._busy = False
@@ -100,6 +103,11 @@ class CommandPanel(Card):
         self.recent_button.setMenu(self.recent_menu)
         row.addWidget(self.recent_button)
         self.body.addLayout(row)
+
+        self.title_panel: TitlePanel | None = None
+        if db is not None:  # the collapsible Title Generator section
+            self.title_panel = TitlePanel(db)
+            self.body.addWidget(self.title_panel)
 
         self.edit = CommandEdit()
         self.edit.setMinimumHeight(64)
@@ -187,8 +195,9 @@ class CommandPanel(Card):
         self._busy = busy
         self.generate_button.setVisible(not busy)
         self.cancel_button.setVisible(busy)
-        for widget in (self.strategy_combo, self.model_combo, self.mode_combo, self.edit):
-            widget.setEnabled(not busy)
+        for widget in (self.strategy_combo, self.model_combo, self.mode_combo, self.edit, self.title_panel):
+            if widget is not None:
+                widget.setEnabled(not busy)
 
     # ------------------------------------------------------------------ menus
     def set_prompts(self, prompts: list[SavedPrompt], recent: list[CommandRecord]) -> None:
@@ -230,5 +239,7 @@ class CommandPanel(Card):
         for index in range(self.mode_combo.count()):
             self.mode_combo.setItemText(index, modes[str(self.mode_combo.itemData(index))])
         self.edit.setPlaceholderText(tr("command.placeholder") + "\n\n" + tr("command.example"))
+        if self.title_panel is not None:
+            self.title_panel.retranslate()
         self._update_counter()
 

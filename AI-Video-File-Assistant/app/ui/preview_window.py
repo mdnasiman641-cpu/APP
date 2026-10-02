@@ -143,7 +143,7 @@ class PreviewModel(QAbstractTableModel):
                 return tr("preview.deleted_forever" if permanent else "preview.to_trash")
             return op.target or ""
         if col == COL_NOTE:
-            return " ".join(op.messages)
+            return " ".join(op.messages) or op.info
         return ""
 
     def setData(self, index: _Index, value: object, role: int = Qt.ItemDataRole.EditRole) -> bool:

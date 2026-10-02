@@ -20,6 +20,7 @@ from app.config.constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT_S,
     DEFAULT_SAMPLE_SIZE,
+    GOOGLE_SEARCH_ENDPOINT,
     MAX_BATCH_SIZE,
     RoutingStrategy,
 )
@@ -56,6 +57,10 @@ class AppSettings:
     sample_size: int = DEFAULT_SAMPLE_SIZE
     use_offline_parser: bool = True
     send_metadata_to_ai: bool = False
+    # --- Google Search (Title Generator context; the API key is in the encrypted store)
+    search_engine_id: str = ""
+    search_endpoint: str = GOOGLE_SEARCH_ENDPOINT
+    search_cache_hours: int = 24
     # --- File operations
     ask_before_apply: bool = True
     create_history: bool = True
@@ -93,6 +98,9 @@ class AppSettings:
         out.batch_size = max(1, min(int(out.batch_size), MAX_BATCH_SIZE))
         out.sample_size = max(1, min(int(out.sample_size), MAX_BATCH_SIZE))
         out.request_timeout_s = max(5, min(int(out.request_timeout_s), 600))
+        out.search_cache_hours = max(0, min(int(out.search_cache_hours), 720))
+        out.search_endpoint = out.search_endpoint.strip() or GOOGLE_SEARCH_ENDPOINT
+        out.search_engine_id = out.search_engine_id.strip()[:120]
         return out
 
 

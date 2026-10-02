@@ -26,7 +26,7 @@ from app.utils.logger import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -77,6 +77,16 @@ CREATE TABLE IF NOT EXISTS model_configs (
 CREATE TABLE IF NOT EXISTS model_health (
     model_id TEXT PRIMARY KEY,
     data     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS title_presets (
+    name       TEXT PRIMARY KEY,
+    data       TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS search_cache (
+    query   TEXT PRIMARY KEY,
+    created REAL NOT NULL,
+    data    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS metadata_cache (
     path     TEXT NOT NULL,
@@ -359,3 +369,48 @@ class Database:
             "INSERT OR REPLACE INTO metadata_cache(path, size, mtime, payload) VALUES(?,?,?,?)",
             (path, size, mtime, json.dumps(payload)),
         )
+
+    # ---------------------------------------------------------- title presets
+    def list_title_presets(self) -> list[str]:
+        rows = self._connection().execute("SELECT name FROM title_presets ORDER BY name COLLATE NOCASE").fetchall()
+        return [str(r["name"]) for r in rows]
+
+    def get_title_preset(self, name: str) -> dict[str, object] | None:
+        row = self._connection().execute("SELECT data FROM title_presets WHERE name = ?", (name,)).fetchone()
+        return None if row is None else json.loads(row["data"])
+
+    def save_title_preset(self, name: str, data: dict[str, object]) -> None:
+        self._connection().execute(
+            "INSERT INTO title_presets(name, data, updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            (name.strip(), json.dumps(data, ensure_ascii=False), now_iso()),
+        )
+
+    def delete_title_preset(self, name: str) -> None:
+        self._connection().execute("DELETE FROM title_presets WHERE name = ?", (name,))
+
+    # ----------------------------------------------------------- search cache
+    def get_search_cache(self, query: str, min_created: float) -> dict[str, object] | None:
+        row = self._connection().execute(
+            "SELECT data FROM search_cache WHERE query = ? AND created >= ?", (query, min_created)
+        ).fetchone()
+        return None if row is None else json.loads(row["data"])
+
+    def put_search_cache(self, query: str, created: float, data: dict[str, object]) -> None:
+        self._connection().execute(
+            "INSERT INTO search_cache(query, created, data) VALUES(?,?,?) "
+            "ON CONFLICT(query) DO UPDATE SET created = excluded.created, data = excluded.data",
+            (query, created, json.dumps(data, ensure_ascii=False)),
+        )
+
+    def purge_search_cache(self, older_than: float | None = None) -> int:
+        """Delete expired entries (or everything when ``older_than`` is None); returns the count."""
+        if older_than is None:
+            cur = self._connection().execute("DELETE FROM search_cache")
+        else:
+            cur = self._connection().execute("DELETE FROM search_cache WHERE created < ?", (older_than,))
+        return cur.rowcount or 0
+
+    def count_search_cache(self) -> int:
+        return int(self._connection().execute("SELECT COUNT(*) FROM search_cache").fetchone()[0])
+

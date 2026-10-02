@@ -16,10 +16,11 @@ review a colour-coded **preview**, click **Apply**, and can **Undo** the whole b
 3. [How a command is processed](#how-a-command-is-processed)
 4. [Safety model](#safety-model)
 5. [AI models, routing and fallback](#ai-models-routing-and-fallback)
-6. [Command examples](#command-examples)
-7. [Undo, history and the undo-trash](#undo-history-and-the-undo-trash)
-8. [Optional: durations and thumbnails (ffmpeg)](#optional-durations-and-thumbnails-ffmpeg)
-9. [Tests](#tests) · [Project layout](#project-layout) · [Extending](#extending-the-app) · [Troubleshooting](#troubleshooting)
+6. [Title Generator (unique titles, Google Search context, presets)](#title-generator)
+7. [Command examples](#command-examples)
+8. [Undo, history and the undo-trash](#undo-history-and-the-undo-trash)
+9. [Optional: durations and thumbnails (ffmpeg)](#optional-durations-and-thumbnails-ffmpeg)
+10. [Tests](#tests) · [Project layout](#project-layout) · [Extending](#extending-the-app) · [Troubleshooting](#troubleshooting)
 
 ## Quick start
 1. Start **AI Video File Assistant.exe**. On first start click **Add Model** in the welcome banner (or *Settings → AI → AI Models → Add Model*),
@@ -135,6 +136,42 @@ command area is saved automatically. Keys from the previous single-Gemini/OpenAI
 *Appearance*: Dark / Light / System. *General*: reopen last folder, **language (English / বাংলা)**, default filter, log level, ffmpeg folder, backup & restore.
 Data folder: `%APPDATA%\AI Video File Assistant` (SQLite database, logs, thumbnail cache). Override with the `AIVFA_DATA_DIR` environment variable.
 
+## Title Generator
+Open **Title Generator** in the AI Command card, tick **Use for the next preview**, select 20 / 50 / 100+ videos and press **Generate Preview**
+(a command is optional — if you type one it can override the panel, e.g. *"Do not use the original filenames. Make them cinematic and suspenseful,
+10–16 words each. Start every title with Blue Bloods."*). Every video gets its **own** title, e.g. `Blue Bloods - One Hidden Clue Changes Everything for the Reagan Family.mp4`.
+
+| Option | Values |
+|---|---|
+| Title mode | **Independent Creative** (default — the file name is only an identifier and is *never sent* to the AI), Partially Connected (loose inspiration), Connected to Filename |
+| Information source | **Gemini / AI only** (default), Google Search + Gemini / AI, Google Search only, Custom prompt |
+| Category · Content/Topic · Keywords | Crime … Emotional or a custom category; free-text topic; comma-separated keywords (used naturally, not forced into every title) |
+| Style · Tone | Cinematic, Story, Dramatic, Suspenseful, Professional, Simple, Emotional, YouTube, Facebook, custom · Neutral … Professional, custom |
+| Word capacity | Short 5–8 · Medium 8–12 · Long 12–18 · Custom min/max. The **series prefix does not count** unless *Prefix counts as words* is ticked |
+| Series prefix · Variation | `Blue Bloods` → `Blue Bloods - <title>` · Low / Medium / **High** |
+| Checks · Custom instructions | Unique title for every video, Do not use original filename, Prevent duplicate titles · free text that is always sent with the request |
+
+**How it works.** Titles are requested in batches (25 per request — 100 videos ≈ 4 requests) through the normal AI router, so the configured models,
+AI mode and **fallback** apply unchanged. The AI answers with titles per item number; the app adds the prefix, keeps the **original extension** and
+builds ordinary rename actions, which go through the usual validation, **preview**, Apply and **Undo**. Before the preview a local checker compares the
+whole batch — exact duplicates, near-duplicates (shared vocabulary, almost identical wording), repeated openings, repeated sentence structures,
+over-used words, word range, and titles that copy the file name or a search-result title — and only the flagged titles are regenerated (at most 3 rounds;
+anything left is reported, and an exact duplicate can never be applied because the preview marks it as a conflict).
+The AI is told it has **not seen the videos**: specific events, characters or places are only allowed when the search context supports them.
+
+**Google Search.** Set the Google API key (Custom Search API enabled) and the Programmable Search Engine ID under *Settings → AI → Google Search*
+(key encrypted with DPAPI, sent as a header). Per file a concise query is built (*Automatic*: `Blue Bloods S05E03 episode` from the file name if
+*Use filename for information lookup* is on, otherwise series + topic; or *Filename*, *Filename + Series*, *Custom* template such as
+`{series} {season} {episode} episode plot`). Identical queries run **once per batch** and are cached locally (default 24 h, **Clear Search Cache**).
+Only titles/snippets of up to 3/5/10 results are kept: HTML stripped, instruction-like text dropped, reliable sources (Wikipedia, IMDb, TVmaze …) first,
+terms confirmed by several sources and disagreements marked — and sent as **context only**. If the search fails, generation continues with the AI only
+(*If Google Search fails, continue with AI only*, on by default) and the preview says so. *Google Search only* uses no AI: it can name episodes from
+search results (Connected modes) but refuses Independent Creative titles because those need an AI model. *Custom prompt* lets your instructions lead
+(mention "search" to add search context). The preview's note column shows `Search: ✓ 5 results · AI: Gemini / gemini-2.5-flash` per file.
+
+**Presets.** *Save Preset / Load Preset / Delete Preset* store the complete configuration (e.g. "Blue Bloods Facebook Titles") in the local database;
+the current panel settings are also restored automatically at start-up.
+
 ## Command examples
 | You type | What happens |
 |---|---|
@@ -174,7 +211,8 @@ adapter, Load Models, routing strategies, fallback (429/5xx/timeout/invalid JSON
 main.py                      entry point (--self-test for packaging checks)
 build.bat / *.spec           build + PyInstaller recipe
 app/config/                  constants (models, limits), typed settings
-app/ai/                      model config/registry/health, provider adapters, task analyzer, router, prompt builder, parser, pipeline
+app/ai/                      model config/registry/health, provider adapters, task analyzer, router, prompt builder, parser, pipeline,
+                             title generator (title_config, title_quality, title_generator, web_search)
 app/files/                   scanner, planner, validators, rename/move engines, operation manager, metadata, thumbnails
 app/database/                SQLite access
 app/workers/                 QRunnable workers (scan, AI, operations, ffprobe) - the UI never blocks

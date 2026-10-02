@@ -35,7 +35,9 @@ from app.ai.prompt_builder import (
 from app.ai.response_parser import ResponseError, parse_response
 from app.ai.schemas import Action, ParsedResponse, RejectedAction
 from app.ai.task_analyzer import TaskProfile, analyze_task
-from app.config.constants import ProcessingMode
+from app.ai.title_config import TitleConfig
+from app.ai.web_search import SearchService
+from app.config.constants import ProcessingMode, TaskType
 from app.config.settings import AppSettings
 from app.files.local_commands import parse_local_command
 from app.files.plan import Plan
@@ -71,6 +73,8 @@ class PipelineRequest:
     workspace: Path
     processing: ProcessingMode
     settings: AppSettings
+    title: TitleConfig | None = None  # Title Generator settings (used when ``title.enabled``)
+    search: SearchService | None = None  # Google Search context for the Title Generator
 
 
 @dataclass(slots=True)
@@ -129,6 +133,8 @@ def run_pipeline(
     """Plan ``request.command`` for ``request.files`` (offline when possible, otherwise via the AI)."""
     cancel = cancel or threading.Event()
     command = request.command.strip()
+    if request.title is not None and request.title.enabled:
+        return _run_title_generator(request, router, cancel, progress)
     if not command:
         raise PipelineError(tr("pipeline.no_command"))
     if not request.files:
@@ -243,3 +249,37 @@ def _ask_ai(
         "route_details": routes[-1].detail_lines() if routes else [],
     }
     return merged, meta
+
+
+def _run_title_generator(
+    request: PipelineRequest, router: ModelRouter, cancel: threading.Event, progress: ProgressFn | None
+) -> PipelineResult:
+    """Title Generator path: unique titles -> rename actions -> the usual planner, validation and preview."""
+    from app.ai.title_generator import TitleGenerator
+
+    if not request.files:
+        raise PipelineError(tr("pipeline.no_files"))
+    if request.processing == ProcessingMode.OFFLINE_ONLY:
+        raise PipelineError(tr("title.offline_only"))
+    generator = TitleGenerator(
+        request.files, request.title or TitleConfig(enabled=True), router, command=request.command, search=request.search,
+        include_metadata=request.settings.send_metadata_to_ai, batch_size=request.settings.batch_size, cancel=cancel,
+        progress=progress,
+    )  # fmt: skip
+    outcome = generator.run()
+    if progress is not None:
+        progress(1, 1, tr("pipeline.planning"))
+    parsed = outcome.parsed
+    plan = Planner(request.workspace, request.files, planner_options(request.settings)).build(parsed.actions, summary=parsed.summary)
+    for op in plan.ops:
+        if op.source in outcome.infos:
+            op.info = outcome.infos[op.source]
+    log.info(
+        "Title Generator done: model=%s requests=%s fallbacks=%s titles=%d",
+        outcome.meta["provider_used"], outcome.meta["ai_requests"], outcome.meta["fallbacks"], len(parsed.actions),
+    )  # fmt: skip
+    return PipelineResult(
+        plan=plan, summary=parsed.summary, warnings=list(parsed.warnings), task_type=TaskType.TITLE_GENERATION.value,
+        files=len(request.files), **outcome.meta,
+    )  # fmt: skip
+

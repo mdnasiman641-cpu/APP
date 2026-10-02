@@ -48,6 +48,7 @@ class PlannedOp:
     overwrite: bool = False  # an existing target will be moved to the undo-trash first
     implicit: bool = False  # created automatically (missing target folder)
     noop: bool = False  # nothing to do (e.g. folder already exists)
+    info: str = ""  # display-only note (e.g. Title Generator: search status and AI model); never affects status
 
     @property
     def counts_as_change(self) -> bool:

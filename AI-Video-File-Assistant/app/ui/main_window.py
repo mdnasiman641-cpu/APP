@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
 from app.ai.ai_router import ModelRouter, make_router
 from app.ai.pipeline import PipelineRequest, PipelineResult
 from app.ai.task_analyzer import analyze_task
+from app.ai.title_config import load_current, save_current
+from app.ai.web_search import make_search_service
 from app.config.constants import APP_NAME, FileKind, ProcessingMode
 from app.context import AppContext
 from app.database.models import CommandRecord, SavedPrompt
@@ -116,6 +118,7 @@ class MainWindow(QMainWindow):
         self.command_panel.routing_changed.connect(self._on_routing_changed)
         self.command_panel.mode_combo.currentIndexChanged.connect(lambda _i: self._update_ai_label())
         self.refresh_models_ui()
+        self.refresh_search_ui()
         self.refresh_prompt_menus()
         self.refresh_undo_button()
         self.show_status(tr("status.ready"))
@@ -144,7 +147,11 @@ class MainWindow(QMainWindow):
         self.files_panel.visible_rows_changed.connect(self._request_visible_metadata)
         self.files_panel.current_entry_changed.connect(self._on_current_entry)
         self.files_panel.details.set_capabilities(probe=self._probe.available, ffmpeg=self._thumbs.available)
-        self.command_panel = CommandPanel(self._icons, self.ctx.registry)
+        self.command_panel = CommandPanel(self._icons, self.ctx.registry, self.ctx.db)
+        self.title_panel = self.command_panel.title_panel
+        assert self.title_panel is not None
+        self.title_panel.set_config(load_current(self.ctx.db))
+        self.title_panel.changed.connect(self._on_title_settings_changed)
         self.command_panel.generate_requested.connect(self.generate_preview)
         self.command_panel.cancel_requested.connect(self.cancel_planning)
         self.command_panel.saved_prompt_chosen.connect(self._use_saved_prompt)
@@ -538,7 +545,8 @@ class MainWindow(QMainWindow):
             self.show_status(tr("status.choose_folder"), "warning")
             return
         command = self.command_panel.command()
-        if not command:
+        title_config = self.title_panel.config()
+        if not command and not title_config.enabled:
             self.show_status(tr("pipeline.no_command"), "warning")
             self.command_panel.edit.setFocus()
             return
@@ -550,11 +558,12 @@ class MainWindow(QMainWindow):
         self.settings = settings
         request = PipelineRequest(
             command=command, files=files, workspace=self.workspace, processing=self.command_panel.processing(),
-            settings=settings,
+            settings=settings, title=title_config if title_config.enabled else None,
+            search=make_search_service(self.ctx) if title_config.enabled and title_config.uses_search else None,
         )  # fmt: skip
         self._plan_generation += 1
         generation = self._plan_generation
-        self._active_command = command
+        self._active_command = command or tr("tg.history_command", count=len(files))
         router = self.make_router()
         self._update_ai_label(router, command, len(files))
         worker = PlanWorker(request, router)
@@ -608,6 +617,13 @@ class MainWindow(QMainWindow):
         )
         self._update_ai_label()
 
+    def _on_title_settings_changed(self) -> None:
+        """Title Generator settings are non-sensitive preferences: auto-saved on every change."""
+        save_current(self.ctx.db, self.title_panel.config())
+
+    def refresh_search_ui(self) -> None:
+        self.title_panel.set_search_configured(make_search_service(self.ctx).configured)
+
     def refresh_models_ui(self) -> None:
         """Models were added / edited / removed: update the combos, the welcome banner and the AI label."""
         self.command_panel.refresh_models()
@@ -649,7 +665,8 @@ class MainWindow(QMainWindow):
         self.command_panel.set_busy(False)
         plan = result.plan
         self._active_provider = result.provider_used
-        self.ctx.db.add_command(self._active_command, self.command_panel.model_choice())
+        if self.command_panel.command():  # (an empty command with the Title Generator is not history-worthy)
+            self.ctx.db.add_command(self._active_command, self.command_panel.model_choice())
         self.refresh_prompt_menus()
         self.set_provider_text(tr("status.provider", text=result.provider_text))
         if result.source == "ai":
@@ -895,6 +912,7 @@ class MainWindow(QMainWindow):
             self.command_panel.set_strategy(self.settings.routing_strategy)
             self.command_panel.set_model_choice(self.settings.preferred_model_id or AUTO)
         self.refresh_models_ui()
+        self.refresh_search_ui()
         if (self.settings.ffmpeg_dir, self.settings.read_metadata) != (previous.ffmpeg_dir, previous.read_metadata):
             self._probe = MetadataProbe(self.settings.ffmpeg_dir)
             self._thumbs = ThumbnailCache(self.settings.ffmpeg_dir)

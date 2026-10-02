@@ -115,6 +115,7 @@ SUGGESTED_MODELS: dict[str, tuple[str, ...]] = {
 }
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GOOGLE_SEARCH_ENDPOINT = "https://www.googleapis.com/customsearch/v1"  # Programmable Search (Title Generator context)
 OPENAI_API_BASE = "https://api.openai.com/v1"
 
 DEFAULT_REQUEST_TIMEOUT_S = 60
