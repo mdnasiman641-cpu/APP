@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QFormLayout, QFrame, QLabel, QVBoxLayout
+from PySide6.QtWidgets import QFormLayout, QFrame, QLabel, QScrollArea, QVBoxLayout, QWidget
 
 from app.files.metadata import VideoMetadata
 from app.files.scanner import FileEntry
@@ -24,7 +24,19 @@ class DetailsPanel(QFrame):
         self.setFixedWidth(256)
         self._icons = icons
         self._entry: FileEntry | None = None
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()  # content scrolls instead of overlapping when the card is short
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        content = QWidget()
+        content.setObjectName("DetailsContent")
+        content.setStyleSheet("QWidget#DetailsContent { background: transparent; }")
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
