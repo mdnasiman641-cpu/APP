@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLayout,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -134,3 +135,16 @@ def clear_layout(layout: QLayout) -> None:
         widget = item.widget()
         if widget is not None:
             widget.deleteLater()
+
+
+def confirm_destructive(parent: QWidget | None, text: str, ok_text: str) -> bool:
+    """``text`` with [Cancel] / [ok_text]; Cancel is the default. True if the user confirmed."""
+    box = QMessageBox(parent)
+    box.setWindowTitle(tr("app.title"))
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setText(text)
+    ok = box.addButton(ok_text, QMessageBox.ButtonRole.DestructiveRole)
+    cancel = box.addButton(tr("common.cancel"), QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(cancel)
+    box.exec()
+    return box.clickedButton() is ok

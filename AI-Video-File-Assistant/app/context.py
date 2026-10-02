@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.ai.model_health import HealthTracker
+from app.ai.model_registry import ModelRegistry
 from app.config.settings import SettingsManager
 from app.database.database import Database
 from app.i18n import tr
@@ -22,11 +24,17 @@ DEFAULT_PROMPTS = (
 
 @dataclass(slots=True)
 class AppContext:
-    """Database + settings + secrets, created once at start-up."""
+    """Database + settings + model registry + health, created once at start-up.
+
+    Start-up order: settings -> model registry (with one-time migration of the old
+    single Gemini/OpenAI configuration) -> health statistics -> saved prompts.
+    """
 
     data_dir: Path
     db: Database
     settings: SettingsManager
+    registry: ModelRegistry
+    health: HealthTracker
 
     @classmethod
     def create(cls, data_dir: Path | None = None) -> AppContext:
@@ -34,7 +42,15 @@ class AppContext:
         data_dir.mkdir(parents=True, exist_ok=True)
         db = Database(data_dir / "app.db")
         secrets = SecretStore(db, default_backend(data_dir))
-        ctx = cls(data_dir=data_dir, db=db, settings=SettingsManager(db, secrets))
+        settings = SettingsManager(db, secrets)
+        registry = ModelRegistry(db, secrets)
+        registry.migrate_legacy()  # old Gemini/OpenAI keys + models -> registry (no re-entry needed)
+        current = settings.reload()
+        health = HealthTracker(
+            db, cooldown_s=current.cooldown_seconds, cooldown_after_failures=current.cooldown_after_failures,
+            enabled=current.health_tracking,
+        )  # fmt: skip
+        ctx = cls(data_dir=data_dir, db=db, settings=settings, registry=registry, health=health)
         ctx.seed_default_prompts()
         interrupted = db.mark_interrupted_operations()
         if interrupted:

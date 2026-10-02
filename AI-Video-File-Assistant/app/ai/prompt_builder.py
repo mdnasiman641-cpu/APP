@@ -97,10 +97,32 @@ class BatchInfo:
     last_item: int
 
 
-def split_batches(entries: Sequence[FileEntry], batch_size: int) -> list[list[FileEntry]]:
-    """Split ``entries`` into chunks of at most ``batch_size`` (``>= 1``)."""
+def split_batches(entries: Sequence[FileEntry], batch_size: int, max_chars: int | None = None) -> list[list[FileEntry]]:
+    """Split ``entries`` into batches of at most ``batch_size`` files *and* about ``max_chars`` of names.
+
+    The character budget keeps very long file names from producing oversized requests; it
+    never creates one request per file unless a single name is itself over the budget.
+    """
     size = max(1, batch_size)
-    return [list(entries[i : i + size]) for i in range(0, len(entries), size)]
+    budget = max_chars if max_chars and max_chars > 0 else None
+    batches: list[list[FileEntry]] = []
+    current: list[FileEntry] = []
+    used = 0
+    for entry in entries:
+        cost = len(entry.rel_path) + 24  # name + JSON overhead per item
+        if current and (len(current) >= size or (budget is not None and used + cost > budget)):
+            batches.append(current)
+            current, used = [], 0
+        current.append(entry)
+        used += cost
+    if current:
+        batches.append(current)
+    return batches
+
+
+def estimate_request_chars(entries: Sequence[FileEntry]) -> int:
+    """Approximate size of the file list for ``entries`` (used for logging and batching)."""
+    return sum(len(e.rel_path) + 24 for e in entries) + len(SYSTEM_PROMPT)
 
 
 def _file_payload(entry: FileEntry, number: int, *, include_metadata: bool) -> dict[str, object]:

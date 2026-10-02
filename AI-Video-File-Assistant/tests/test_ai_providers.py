@@ -1,4 +1,8 @@
-"""Gemini / OpenAI providers against a real local HTTP server, plus the router's fallback logic."""
+"""Provider adapters (Gemini, OpenAI, OpenAI-compatible, Custom) against a real local HTTP server.
+
+No real API keys are used: every adapter is pointed at :class:`FakeAIServer` through its
+configurable base URL.
+"""
 
 from __future__ import annotations
 
@@ -6,25 +10,36 @@ import json
 
 import pytest
 
-from app.ai import gemini_provider, openai_provider
-from app.ai.ai_router import AIRouter, AllProvidersFailed, make_provider_factory
-from app.ai.base_provider import AIProvider, AIRequest, AIResponse
+from app.ai.base_provider import AIRequest
 from app.ai.errors import AIError, ErrorKind
-from app.ai.gemini_provider import GeminiProvider
-from app.ai.openai_provider import OpenAIProvider
-from app.config.constants import Provider
+from app.ai.gemini_provider import GeminiProvider as _Gemini
+from app.ai.model_config import ModelConfig
+from app.ai.openai_provider import CustomProvider, OpenAICompatibleProvider
+from app.ai.openai_provider import OpenAIProvider as _OpenAI
+from app.ai.providers import build_for_listing, build_provider
+from app.workers.ai_worker import ConnectionTestWorker, LoadModelsWorker
 from tests.fake_ai_server import FakeAIServer, gemini_ok, openai_ok
 
 REQUEST = AIRequest(system_prompt="SYSTEM JSON", user_prompt="USER {…}")
 SECRET = "AIzaSySECRETKEY1234567890abcdefghijklm"
 
 
+BASE: dict[str, str] = {}
+
+
 @pytest.fixture
-def server(monkeypatch):
+def server():
     with FakeAIServer() as srv:
-        monkeypatch.setattr(gemini_provider, "GEMINI_API_BASE", srv.base)
-        monkeypatch.setattr(openai_provider, "OPENAI_API_BASE", srv.base)
+        BASE["url"] = srv.base
         yield srv
+
+
+def GeminiProvider(key, model, timeout=5, base_url=None):
+    return _Gemini(key, model, timeout, base_url or BASE["url"])
+
+
+def OpenAIProvider(key, model, timeout=5, base_url=None):
+    return _OpenAI(key, model, timeout, base_url or BASE["url"])
 
 
 # ----------------------------------------------------------------- Gemini
@@ -136,10 +151,9 @@ def test_timeout_is_reported(server):
     assert err.value.kind == ErrorKind.TIMEOUT
 
 
-def test_network_unreachable(monkeypatch):
-    monkeypatch.setattr(openai_provider, "OPENAI_API_BASE", "http://127.0.0.1:1")  # nothing listens
+def test_network_unreachable():
     with pytest.raises(AIError) as err:
-        OpenAIProvider("k", "m", 3).generate(REQUEST)
+        OpenAIProvider("k", "m", 3, base_url="http://127.0.0.1:1").generate(REQUEST)  # nothing listens
     assert err.value.kind == ErrorKind.NETWORK
 
 
@@ -166,120 +180,137 @@ def test_error_details_never_leak_the_key(server):
     assert SECRET not in str(err.value) and SECRET not in err.value.user_message
 
 
-def test_test_connection_reports_ok_and_failure(server):
+def test_test_connection_sends_a_minimal_request_and_times_it(server):
     server.queue(200, {"data": [{"id": "gpt-4o-mini"}]})
+    server.queue(200, openai_ok('{"ok": true}'))
     ok = OpenAIProvider("k", "gpt-4o-mini", 5).test_connection()
-    assert ok.ok and ok.models == ["gpt-4o-mini"]
-    server.queue(200, {"data": [{"id": "gpt-4o-mini"}]})
-    missing = OpenAIProvider("k", "nope", 5).test_connection()
-    assert missing.ok and "nope" in missing.message
+    assert ok.ok and ok.models == ["gpt-4o-mini"] and ok.latency_s is not None
+    assert "Connection successful" in ok.message and "gpt-4o-mini" in ok.message
+    assert json.loads(server.requests[1]["body"])["model"] == "gpt-4o-mini"
+
+
+def test_test_connection_failures(server):
     server.queue(401, {"error": {"message": "Incorrect API key"}})
     bad = OpenAIProvider("k", "m", 5).test_connection()
     assert not bad.ok and "Authentication" in bad.message
+    server.queue(200, {"data": []})
+    server.queue(200, openai_ok("Sure! Here you go."))  # answer is not JSON
+    prose = OpenAIProvider("k", "m", 5).test_connection()
+    assert not prose.ok and "JSON" in prose.message
+    server.queue(200, {"data": []})
+    server.queue(404, {"error": {"message": "The model `nope` does not exist"}})
+    missing = OpenAIProvider("k", "nope", 5).test_connection()
+    assert not missing.ok
 
 
-# ----------------------------------------------------------------- router
-class FakeProvider(AIProvider):
-    def __init__(self, pid: str, *, fail: ErrorKind | None = None, text: str = '{"actions":[]}') -> None:
-        self.id = pid
-        self.display_name = pid
-        self._fail, self._text = fail, text
-        self.calls = 0
-        self.model = "m"
-
-    def __init_subclass__(cls) -> None:  # pragma: no cover
-        super().__init_subclass__()
-
-    def generate(self, request):
-        self.calls += 1
-        if self._fail:
-            raise AIError(self._fail, self.id, "simulated")
-        return AIResponse(self._text, self.id, "m")
-
-    def list_models(self):
-        return []
+# ------------------------------------------------- base URL configuration
+def test_gemini_uses_configured_base_url(server):
+    server.queue(200, gemini_ok("{}"))
+    provider = _Gemini("k", "m", 5, server.base + "/v1beta/")  # trailing slash is normalised
+    provider.generate(REQUEST)
+    assert server.requests[0]["path"] == "/v1beta/models/m:generateContent"
 
 
-def router_with(providers: dict, **kw) -> AIRouter:
-    return AIRouter(lambda pid: providers.get(pid), **kw)
+def test_default_base_urls_are_official_endpoints():
+    assert _Gemini("k", "m").base_url.startswith("https://generativelanguage.googleapis.com")
+    assert _OpenAI("k", "m").base_url == "https://api.openai.com/v1"
 
 
-def test_explicit_provider_never_falls_back():
-    g, o = FakeProvider("gemini", fail=ErrorKind.NETWORK), FakeProvider("openai")
-    r = router_with({"gemini": g, "openai": o})
-    with pytest.raises(AllProvidersFailed) as err:
-        r.generate(REQUEST, Provider.GEMINI)
-    assert o.calls == 0 and err.value.kind == ErrorKind.NETWORK
-    assert "Gemini request failed." in err.value.user_message
+def test_missing_base_url_for_compatible_provider_is_rejected():
+    with pytest.raises(AIError) as err:
+        OpenAICompatibleProvider(None, "m", 5, "")
+    assert err.value.kind == ErrorKind.BAD_REQUEST
 
 
-def test_auto_uses_preferred_provider_and_reports_it():
-    g, o = FakeProvider("gemini"), FakeProvider("openai")
-    result = router_with({"gemini": g, "openai": o}).generate(REQUEST, Provider.AUTO)
-    assert result.provider_used == "gemini" and not result.fell_back and o.calls == 0
-    assert result.status_text == "Gemini ✓"
+# ------------------------------------------------------ OpenAI-compatible
+def test_openai_compatible_works_without_key(server):
+    server.queue(200, openai_ok('{"actions": []}'))
+    result = OpenAICompatibleProvider(None, "llama3.1:8b", 5, server.base + "/v1").generate(REQUEST)
+    assert json.loads(result.text) == {"actions": []}
+    sent = server.requests[0]
+    assert sent["path"] == "/v1/chat/completions" and "authorization" not in sent["headers"]
 
 
-def test_auto_preferred_can_be_openai():
-    g, o = FakeProvider("gemini"), FakeProvider("openai")
-    result = router_with({"gemini": g, "openai": o}, preferred="openai").generate(REQUEST, Provider.AUTO)
-    assert result.provider_used == "openai"
+def test_openai_compatible_sends_bearer_key_when_given(server):
+    server.queue(200, openai_ok("{}"))
+    OpenAICompatibleProvider("or-key-123", "m", 5, server.base).generate(REQUEST)
+    assert server.requests[0]["headers"]["authorization"] == "Bearer or-key-123"
 
 
-def test_auto_falls_back_and_says_so():
-    g, o = FakeProvider("gemini", fail=ErrorKind.RATE_LIMIT), FakeProvider("openai")
-    result = router_with({"gemini": g, "openai": o}).generate(REQUEST, Provider.AUTO)
-    assert result.provider_used == "openai" and result.fell_back
-    assert result.status_text == "Gemini failed → OpenAI fallback ✓"
-    assert [a.provider for a in result.attempts] == ["gemini", "openai"]
+def test_openai_compatible_retries_without_json_mode(server):
+    server.queue(400, {"error": {"message": "Unsupported parameter: response_format"}})
+    server.queue(200, openai_ok('{"actions": []}'))
+    result = OpenAICompatibleProvider(None, "m", 5, server.base).generate(REQUEST)
+    assert json.loads(result.text) == {"actions": []}
+    first, second = (json.loads(r["body"]) for r in server.requests)
+    assert "response_format" in first and "response_format" not in second
 
 
-def test_auto_with_fallback_disabled_fails():
-    g, o = FakeProvider("gemini", fail=ErrorKind.TIMEOUT), FakeProvider("openai")
-    with pytest.raises(AllProvidersFailed):
-        router_with({"gemini": g, "openai": o}, fallback_mode="off").generate(REQUEST, Provider.AUTO)
-    assert o.calls == 0
+def test_openai_compatible_content_parts_and_unfiltered_listing(server):
+    server.queue(200, {"choices": [{"message": {"content": [{"type": "text", "text": '{"a":'}, {"type": "text", "text": "1}"}]}}]})
+    assert OpenAICompatibleProvider(None, "m", 5, server.base).generate(REQUEST).text == '{"a":1}'
+    server.queue(200, {"data": [{"id": "mistral-large"}, {"id": "llama-3.1-70b"}, {"id": "text-embedding-x"}]})
+    assert OpenAICompatibleProvider(None, "m", 5, server.base).list_models() == ["llama-3.1-70b", "mistral-large", "text-embedding-x"]
 
 
-def test_auto_ask_mode_requires_confirmation():
-    g, o = FakeProvider("gemini", fail=ErrorKind.NETWORK), FakeProvider("openai")
-    r = router_with({"gemini": g, "openai": o}, fallback_mode="ask")
-    asked = []
-    result = r.generate(REQUEST, Provider.AUTO, confirm_fallback=lambda f, e, n: asked.append((f, n)) or True)
-    assert asked == [("gemini", "openai")] and result.provider_used == "openai"
-    with pytest.raises(AllProvidersFailed):
-        r.generate(REQUEST, Provider.AUTO, confirm_fallback=lambda f, e, n: False)
-    with pytest.raises(AllProvidersFailed):
-        r.generate(REQUEST, Provider.AUTO)  # no confirm callback => never silently switch
+def test_listing_404_means_unsupported(server):
+    server.queue(404, {"error": {"message": "Not found"}})
+    with pytest.raises(AIError) as err:
+        OpenAICompatibleProvider(None, "m", 5, server.base).list_models()
+    assert err.value.kind == ErrorKind.LISTING_UNSUPPORTED
 
 
-def test_auto_skips_provider_without_key_and_reports_it():
-    o = FakeProvider("openai")
-    result = router_with({"openai": o}).generate(REQUEST, Provider.AUTO)
-    assert result.provider_used == "openai"
-    assert result.status_text == "Gemini has no API key → OpenAI ✓"
+def test_custom_provider_has_no_json_mode_and_no_listing(server):
+    server.queue(200, openai_ok('{"actions": []}'))
+    provider = CustomProvider(None, "my-model", 5, server.base)
+    provider.generate(REQUEST)
+    assert "response_format" not in json.loads(server.requests[0]["body"])
+    with pytest.raises(AIError) as err:
+        provider.list_models()
+    assert err.value.kind == ErrorKind.LISTING_UNSUPPORTED
 
 
-def test_both_fail_lists_both_errors():
-    g, o = FakeProvider("gemini", fail=ErrorKind.AUTH), FakeProvider("openai", fail=ErrorKind.NETWORK)
-    with pytest.raises(AllProvidersFailed) as err:
-        router_with({"gemini": g, "openai": o}).generate(REQUEST, Provider.AUTO)
-    assert "Gemini request failed." in err.value.user_message and "OpenAI request failed." in err.value.user_message
+# ------------------------------------------------------- factory/workers
+def test_build_provider_uses_the_configuration(server):
+    config = ModelConfig.new("openai_compatible", "qwen2.5", base_url=server.base + "/v1", timeout_s=17)
+    provider = build_provider(config, None)
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.model == "qwen2.5" and provider.timeout == 17 and provider.base_url == server.base + "/v1"
+    with pytest.raises(AIError) as err:
+        build_provider(ModelConfig.new("gemini", "m"), None)  # Gemini needs a key
+    assert err.value.kind == ErrorKind.NO_KEY
 
 
-def test_no_keys_at_all_gives_actionable_message():
-    with pytest.raises(AllProvidersFailed) as err:
-        router_with({}).generate(REQUEST, Provider.AUTO)
-    assert "API key" in err.value.user_message and err.value.kind == ErrorKind.NO_KEY
+def test_load_models_worker(server):
+    server.queue(200, {"models": [{"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]}]})
+    assert LoadModelsWorker("gemini", server.base, "k").execute() == ["gemini-2.5-flash"]
+    assert server.requests[0]["headers"]["x-goog-api-key"] == "k"
+    server.queue(404, {"error": {"message": "no"}})
+    worker = LoadModelsWorker("openai_compatible", server.base, None)
+    with pytest.raises(AIError) as err:
+        worker.execute()
+    assert worker.friendly_error(err.value) == "Model listing is not available for this provider. Enter the model ID manually."
+    custom = LoadModelsWorker("custom", server.base, None)
+    with pytest.raises(AIError) as err2:
+        custom.execute()
+    assert "Enter the model ID manually" in custom.friendly_error(err2.value)
+    assert build_for_listing("openai", server.base, "k").base_url == server.base
 
 
-def test_factory_builds_providers_from_current_settings(tmp_path):
-    from app.context import AppContext
+def test_load_models_worker_rejects_bad_urls():
+    worker = LoadModelsWorker("openai_compatible", "http://example.com/v1", None)  # plain http to a public host
+    with pytest.raises(AIError) as err:
+        worker.execute()
+    assert "https" in worker.friendly_error(err.value).lower()
 
-    ctx = AppContext.create(tmp_path / "d")
-    factory = make_provider_factory(ctx.settings)
-    assert factory("gemini") is None
-    ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
-    ctx.settings.update(gemini_model="custom-model", request_timeout_s=33)
-    provider = factory("gemini")
-    assert isinstance(provider, GeminiProvider) and provider.model == "custom-model" and provider.timeout == 33
+
+def test_connection_worker_end_to_end(server):
+    server.queue(200, {"data": [{"id": "m"}]})
+    server.queue(200, openai_ok('{"ok": true}'))
+    config = ModelConfig.new("openai_compatible", "m", base_url=server.base)
+    result = ConnectionTestWorker(config, None).execute()
+    assert result.ok and result.latency_s is not None
+    missing_key = ConnectionTestWorker(ModelConfig.new("openai", "gpt-4o-mini"), None).execute()
+    assert not missing_key.ok
+
+

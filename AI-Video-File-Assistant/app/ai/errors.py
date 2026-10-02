@@ -20,7 +20,13 @@ class ErrorKind(str, Enum):
     BLOCKED = "blocked"
     INVALID_RESPONSE = "invalid_response"
     CANCELLED = "cancelled"
+    LISTING_UNSUPPORTED = "listing_unsupported"
+    NO_MODELS = "no_models"
     UNKNOWN = "unknown"
+
+
+# Failures worth retrying on the *same* model (transient); everything else moves on to the next model.
+RETRYABLE_SAME_MODEL = frozenset({ErrorKind.TIMEOUT, ErrorKind.SERVER, ErrorKind.NETWORK, ErrorKind.INVALID_RESPONSE})
 
 
 PROVIDER_NAMES = {"gemini": "Gemini", "openai": "OpenAI"}
@@ -61,5 +67,10 @@ class AIError(Exception):
 
     @property
     def allows_fallback(self) -> bool:
-        """Errors for which trying the other provider is sensible."""
+        """Errors for which trying another model is sensible (429, 5xx, timeouts, bad JSON, auth, ...)."""
         return self.kind not in {ErrorKind.CANCELLED}
+
+    @property
+    def category(self) -> str:
+        """Short label for logs and the UI, e.g. ``HTTP 429`` or ``timeout``."""
+        return f"HTTP {self.status}" if self.status else self.kind.value

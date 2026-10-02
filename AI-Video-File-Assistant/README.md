@@ -4,7 +4,9 @@ A Windows desktop app that renames and organises (video) files from **plain-lang
 You pick a folder, type what you want — *"Remove 1080p and WEB-DL from all filenames"*, *"সব ভিডিওর নামের শেষে 01 থেকে numbering দাও"* —
 review a colour-coded **preview**, click **Apply**, and can **Undo** the whole batch afterwards.
 
-* Gemini **or** OpenAI (or **Auto** with fallback) — the AI only *describes* the change; the app validates and performs it.
+* **Any number of AI models**: Gemini, OpenAI, any OpenAI-compatible server (OpenRouter, Groq, LM Studio, Ollama, vLLM …) or a custom endpoint, each with its own
+  base URL and API key. A router picks the model per task and **falls back** automatically (429, quota, 5xx, timeouts, invalid answers).
+  The AI only *describes* the change; the app validates and performs it.
 * Simple commands run **offline** (no AI request, no cost). Big folders need **one** request, not one per file.
 * Nothing is changed without a preview. Every batch is journaled, atomic and undoable.
 
@@ -13,16 +15,18 @@ review a colour-coded **preview**, click **Apply**, and can **Undo** the whole b
 2. [Building the .exe](#building-the-exe)
 3. [How a command is processed](#how-a-command-is-processed)
 4. [Safety model](#safety-model)
-5. [Settings, API keys and models](#settings-api-keys-and-models)
+5. [AI models, routing and fallback](#ai-models-routing-and-fallback)
 6. [Command examples](#command-examples)
 7. [Undo, history and the undo-trash](#undo-history-and-the-undo-trash)
 8. [Optional: durations and thumbnails (ffmpeg)](#optional-durations-and-thumbnails-ffmpeg)
 9. [Tests](#tests) · [Project layout](#project-layout) · [Extending](#extending-the-app) · [Troubleshooting](#troubleshooting)
 
 ## Quick start
-1. Start **AI Video File Assistant.exe**. 2. *Settings → AI*: paste a Gemini and/or OpenAI API key and press **Test Connection**.
-3. **Browse** (or drag & drop a folder). 4. Type a command, choose **Gemini / OpenAI / Auto**, press **Generate Preview** (Ctrl+Enter).
-5. Check the preview, then **Apply Changes**. 6. Changed your mind? **Undo** (top right) or open **History**.
+1. Start **AI Video File Assistant.exe**. On first start click **Add Model** in the welcome banner (or *Settings → AI → AI Models → Add Model*),
+   pick a provider type, paste the API key, choose a model (or **Load Models**), press **Test Connection**, then **Save**.
+2. **Browse** (or drag & drop a folder). 3. Type a command, pick the **AI mode** (default *Auto + Fallback*) and **Model** (default *Automatic*),
+   press **Generate Preview** (Ctrl+Enter). The line under the command shows `AI: Gemini / gemini-2.5-flash` before the request and what was used afterwards.
+4. Check the preview, then **Apply Changes**. 5. Changed your mind? **Undo** (top right) or open **History**.
 
 Offline commands need no key at all. Only file **names** (never file contents, never full paths) are sent to an AI.
 
@@ -54,7 +58,9 @@ Both builds are verified in CI-style runs of `--self-test`. Ship the one-folder 
 command ──► offline parser ─(simple? done, 0 requests)
               │ no
               ▼
-        AI router ── Gemini / OpenAI / Auto(+fallback) ──► JSON only
+   task analyzer ──► model registry ──► capability filter ──► strategy / priority
+              ▼
+        AI router ── model 1 ─(429/5xx/timeout/bad JSON)─► model 2 … ──► JSON only
               ▼
         strict response parser   (untrusted data!)
               ▼
@@ -68,7 +74,8 @@ command ──► offline parser ─(simple? done, 0 requests)
 * **Rule actions** (`remove_text`, `replace_text`, `add_prefix`, `add_suffix`, `numbering`, `change_case`, `sort`, and `move`/`copy`/`delete` with `match`) are described
   once by the AI and applied locally to every file — so a 5 000-file folder costs **one** request.
 * **Explicit actions** (`rename`, `move`, `copy`, `delete`, `create_folder`) are used when each file needs its own interpretation; those files are sent in
-  **batches** (*Settings → Files per AI request*, default 50).
+  **batches** (*Settings → Files per AI request*, default 50) that also respect a character budget (*Max characters per request*), so 500 files become
+  a handful of requests, never 500.
 * `sort` reorders the working list (affects numbering order and the table); it never touches files.
 
 ## Safety model
@@ -83,16 +90,49 @@ command ──► offline parser ─(simple? done, 0 requests)
   Auto Apply (off by default) never applies plans containing deletes, conflicts or invalid rows.
 * **Two-phase renames** (`A→B`, `B→C`, swaps, case-only changes) go through `.tmp_ai_*` temp names so nothing is ever overwritten.
 * **All-or-nothing**: every step is journaled in SQLite first; if one file fails (locked, disk full, cancelled) everything done so far is rolled back.
-* API keys are stored encrypted with **Windows DPAPI** (only your Windows user can decrypt), shown as `************ABCD`, sent in HTTP *headers* (never URLs), and scrubbed from logs.
+* API keys are stored **per model**, encrypted with **Windows DPAPI** (only your Windows user can decrypt), shown as `************ABCD`, sent in HTTP *headers* (never URLs),
+  never written to the settings table, backups or logs. Base URLs must be `https://` (plain `http://` is allowed only for `localhost`/private-network servers).
 
-## Settings, API keys and models
-*Settings → AI* has key entry (hidden by default, **Show/Hide**, **Test Connection** — a free models-list call —, **Remove Key**), the **model** for each provider (editable;
-**Test Connection** also refreshes the list from your account), default provider, *Auto* preferred provider and fallback behaviour (automatic / ask / never),
-batch size, timeout and *Handle simple commands offline*. **No model name is hard-coded outside `app/config/constants.py`** — change it in Settings whenever vendors rename models.
+## AI models, routing and fallback
+**Configure several models** in *Settings → AI → AI Models*. The table shows Provider, Model, Base URL, Status (Online / Cooldown / No key / Disabled / Untested / Error),
+Enabled, Priority and Capabilities; selecting a row shows its statistics (`✓ 98% success · avg 1.8s · used 43×`, last success/failure, last error).
+Buttons: **Add Model, Edit, Remove, Test Connection, Load Models, Enable/Disable, Move Up/Down**. Each model has:
+
+| Field | Notes |
+|---|---|
+| Provider type | Gemini · OpenAI · OpenAI-compatible · Custom (chat-completions format, no JSON mode / listing) |
+| Display name, Base URL | Base URL is pre-filled for Gemini/OpenAI and editable (proxies, regional endpoints) |
+| API key | Its **own** key per model (two models may use different accounts). When editing: **Keep Existing Key** / **Replace Key** — an empty field never wipes a key. **Remove Key** asks *"Remove this saved API key from this computer?"* and deletes only the key. |
+| Model | Typed, or picked with **Load Models** |
+| Priority, Timeout, Max retries, Enabled | Lower priority number = tried first |
+| Capabilities | Text, JSON, Long context, Fast, Vision — used by the task-aware routing |
+| Optional limits / prices | Requests per minute/day and price per 1M tokens — **only what you enter**; the app never guesses prices |
+
+**Load Models** calls the provider's model-list endpoint with the form's base URL and key (Gemini `GET /models`, OpenAI-style `GET /models`), shows the list,
+and every model you tick is saved as its own configuration (same URL, key and settings). Providers without a list endpoint (or a `404`) show
+*"Model listing is not available for this provider. Enter the model ID manually."* **Test Connection** validates URL + key, sends one tiny request,
+measures the response time and checks the answer is JSON.
+
+**AI mode (routing strategy)** — in the command area and in *Settings → AI → Routing Strategy*:
+* **Auto + Fallback** (default): the task analyzer classifies the command (simple / complex rename / titles / descriptions / organisation / large batch / JSON),
+  the router keeps enabled models that have a key and the needed capabilities, ranks them (capability match, then priority; *cost-aware* adds price after
+  capability), puts a chosen **Model** first, and skips models in **cooldown** or over their rate limit. On HTTP 429/quota, 5xx, timeout, network failure or an
+  invalid/unstructured answer it moves to the next model. Transient errors are retried on the same model up to its *Max retries*; the number of models
+  tried is capped (*Max models tried per request*), so there are no endless loops. An **unsafe** answer stops immediately — it never shops for another model.
+* **Auto**: same choice, no fallback. **Manual**: only the selected model. **Cheapest / Fastest / Highest Priority**: rank by your prices / measured latency / list order, with fallback.
+* **Health**: every call records success/failure, latency and tokens. A rate limit puts a model in cooldown at once; repeated failures (default 2) start a cooldown
+  that doubles while it keeps failing. After the cooldown it gets its normal place back.
+
+What happened is always visible: `AI: Gemini / gemini-2.5-flash` before the request; afterwards e.g.
+`Gemini / gemini-2.5-flash (HTTP 429) → OpenAI / gpt-4o-mini ✓` with *Primary / Failed / Fallback / Success* lines, and the preview header shows
+`Completed · Model: … · Requests: 2 · Fallbacks: 1 · Files: 500`. Simple commands are still handled **offline** first.
+
+**Persistence & migration.** Models, priorities, capabilities, strategy, preferred model and all preferences survive restarts; the AI mode / model chosen in the
+command area is saved automatically. Keys from the previous single-Gemini/OpenAI version are **migrated automatically** (no re-entry).
+*Settings → General → Backup & Restore* exports preferences, model configurations and saved prompts **without API keys**.
+
 *File Operations*: ask before applying, operation history, prevent overwrite, include subfolders, **Auto Apply (off by default)**, duplicate-name policy, delete mode (undo-trash / permanent).
-*Appearance*: Dark / Light / System. *General*: reopen last folder, **language (English / বাংলা)**, default filter, log level, ffmpeg folder.
-
-In **Auto** mode the status bar always shows what happened — `Gemini ✓` or `Gemini failed → OpenAI fallback ✓`; explicit Gemini/OpenAI choices never fall back.
+*Appearance*: Dark / Light / System. *General*: reopen last folder, **language (English / বাংলা)**, default filter, log level, ffmpeg folder, backup & restore.
 Data folder: `%APPDATA%\AI Video File Assistant` (SQLite database, logs, thumbnail cache). Override with the `AIVFA_DATA_DIR` environment variable.
 
 ## Command examples
@@ -125,15 +165,16 @@ and selecting a video shows a cached **thumbnail**, resolution, fps and codecs. 
 python -m pip install -r requirements-dev.txt
 python -m pytest            # headless (QT_QPA_PLATFORM=offscreen is set automatically)
 ```
-Over 500 tests cover validation, path traversal, collisions, two-phase renames, rollback, undo, recovery, JSON parsing, AI/offline command handling, API failures
-(against a real local HTTP server), Bangla/Unicode names, the GUI workflow and 20 000-row performance. ffmpeg tests skip automatically if ffmpeg is absent.
+Over 600 tests cover validation, path traversal, collisions, two-phase renames, rollback, undo, recovery, JSON parsing, AI/offline command handling, every provider
+adapter, Load Models, routing strategies, fallback (429/5xx/timeout/invalid JSON), cooldowns, migration, backup without keys and persistence across restarts
+(all against a fake local HTTP server — no real API keys are needed), Bangla/Unicode names, the GUI workflow and 20 000-row performance. ffmpeg tests skip automatically if ffmpeg is absent.
 
 ## Project layout
 ```
 main.py                      entry point (--self-test for packaging checks)
 build.bat / *.spec           build + PyInstaller recipe
 app/config/                  constants (models, limits), typed settings
-app/ai/                      providers, router, prompt builder, response parser, schemas, pipeline
+app/ai/                      model config/registry/health, provider adapters, task analyzer, router, prompt builder, parser, pipeline
 app/files/                   scanner, planner, validators, rename/move engines, operation manager, metadata, thumbnails
 app/database/                SQLite access
 app/workers/                 QRunnable workers (scan, AI, operations, ffprobe) - the UI never blocks
@@ -143,7 +184,8 @@ tests/                       pytest suite
 ```
 
 ## Extending the app
-* **New AI provider**: subclass `AIProvider` (`app/ai/base_provider.py`), register it in `app/ai/ai_router.py:PROVIDER_CLASSES`.
+* **New AI provider type**: subclass `AIProvider` (`app/ai/base_provider.py`), add it to `app/ai/providers.py:ADAPTERS` and `app/ai/model_config.py:PROVIDER_TYPES`.
+  Most hosted services already work as *OpenAI-compatible*.
 * **New action type**: add a dataclass in `app/ai/schemas.py`, a builder in `app/ai/response_parser.py`, handle it in `RuleEngine`/`Planner`, and describe it in `prompt_builder.SYSTEM_PROMPT`.
 * **New language**: add `app/i18n/<code>.py` (same keys) and register it in `app/i18n/__init__.py`; a test enforces key parity.
 * The architecture leaves room for the roadmap items (YouTube titles/descriptions, subtitle management, duplicate detection, categorisation, batch metadata editing, workflows):
@@ -153,7 +195,9 @@ tests/                       pytest suite
 | Message | Meaning |
 |---|---|
 | *Authentication error* | The key was rejected — re-enter it (Settings → AI → Test Connection). |
-| *Rate limit or quota reached* | Wait, check your plan, or switch to the other provider / Auto. |
+| *Rate limit or quota reached* | The model rests in cooldown; with *Auto + Fallback* the next model is used. Add another model or wait. |
+| *No usable AI model is configured* | Add a model (Settings → AI → AI Models) or give the existing one its API key. |
+| *Model listing is not available…* | The provider has no model-list endpoint — type the model ID. |
 | *Network error / Timeout* | No connection or a slow reply; raise *Request timeout* or retry. |
 | *The file is in use by another program* | A player/Explorer pane holds the file; close it and apply again (nothing was changed). |
 | *The folder changed since the preview* | Files were added/removed after the preview; generate a new one. |

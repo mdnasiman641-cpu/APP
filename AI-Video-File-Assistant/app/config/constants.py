@@ -20,12 +20,51 @@ IS_WINDOWS = sys.platform == "win32"
 CASE_INSENSITIVE_FS = IS_WINDOWS
 
 
-class Provider(str, Enum):
-    """AI provider identifiers as stored in settings and shown in the UI."""
+class ProviderType(str, Enum):
+    """Kinds of AI endpoints a model configuration can talk to (each has its own adapter)."""
 
     GEMINI = "gemini"
     OPENAI = "openai"
-    AUTO = "auto"
+    OPENAI_COMPATIBLE = "openai_compatible"
+    CUSTOM = "custom"
+
+
+class Capability(str, Enum):
+    """What a configured model is good at (set by the user; used by the router)."""
+
+    TEXT = "text"
+    JSON = "json"
+    LONG_CONTEXT = "long_context"
+    FAST = "fast"
+    VISION = "vision"
+
+
+class RoutingStrategy(str, Enum):
+    """How the router picks a model for a request."""
+
+    AUTO_FALLBACK = "auto_fallback"  # best suitable model, then the next ones if it fails (default)
+    AUTO = "auto"  # best suitable model only
+    MANUAL = "manual"  # exactly the model the user chose
+    CHEAPEST = "cheapest"  # lowest known price first (unknown prices last), with fallback
+    FASTEST = "fastest"  # lowest measured latency first, with fallback
+    HIGHEST_PRIORITY = "highest_priority"  # strict priority order, with fallback
+
+    @property
+    def falls_back(self) -> bool:
+        return self not in (RoutingStrategy.AUTO, RoutingStrategy.MANUAL)
+
+
+class TaskType(str, Enum):
+    """What kind of work a command needs (decides model suitability)."""
+
+    SIMPLE_DETERMINISTIC = "simple_deterministic"
+    COMPLEX_RENAME = "complex_rename"
+    TITLE_GENERATION = "title_generation"
+    DESCRIPTION_GENERATION = "description_generation"
+    FILE_ORGANIZATION = "file_organization"
+    LARGE_BATCH = "large_batch"
+    STRUCTURED_JSON = "structured_json"
+    GENERAL = "general"
 
 
 class ProcessingMode(str, Enum):
@@ -63,20 +102,29 @@ DOCUMENT_EXTENSIONS = frozenset(
 )  # fmt: skip
 
 # ---------------------------------------------------------------------------
-# AI configuration. Model names are *defaults only*; users change them in
-# Settings. They are never referenced anywhere else in the code base.
+# AI configuration. Model names / URLs below are *defaults and suggestions only*;
+# every model configuration (Settings -> AI -> AI Models) can override them.
 # ---------------------------------------------------------------------------
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
-SUGGESTED_GEMINI_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro")
-SUGGESTED_OPENAI_MODELS = ("gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1")
+SUGGESTED_MODELS: dict[str, tuple[str, ...]] = {
+    "gemini": ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"),
+    "openai": ("gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"),
+    "openai_compatible": (),
+    "custom": (),
+}
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 OPENAI_API_BASE = "https://api.openai.com/v1"
 
 DEFAULT_REQUEST_TIMEOUT_S = 60
+DEFAULT_MAX_RETRIES = 1  # extra tries on the *same* model for transient errors
+DEFAULT_MAX_FALLBACK_ATTEMPTS = 4  # different models tried for one request at most
+DEFAULT_COOLDOWN_S = 120
+DEFAULT_COOLDOWN_AFTER_FAILURES = 2
 DEFAULT_BATCH_SIZE = 50  # filenames per AI request
 MAX_BATCH_SIZE = 200
+DEFAULT_MAX_REQUEST_CHARS = 30_000  # file-name payload budget per request (split into batches beyond it)
 DEFAULT_SAMPLE_SIZE = DEFAULT_BATCH_SIZE
 MAX_AI_RESPONSE_CHARS = 4_000_000
 MAX_ACTIONS_PER_RESPONSE = 20_000

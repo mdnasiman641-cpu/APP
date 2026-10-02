@@ -7,6 +7,7 @@ import logging
 import pytest
 from PySide6.QtWidgets import QInputDialog, QMessageBox
 
+from app.ai.model_config import ModelConfig
 from app.config.constants import TRASH_DIR_NAME
 from app.context import AppContext
 from app.i18n import set_language
@@ -38,18 +39,24 @@ def test_default_prompts_are_present_with_readable_names(ctx):
     assert all(not n.startswith("prompt.default") for n in names)  # no untranslated keys leaked into the data
 
 
+def add_openai(ctx):
+    return ctx.registry.add(ModelConfig.new("openai", "gpt-4o-mini"), "sk-test-1234567890abcdefgh")
+
+
 def test_prompt_crud(qapp, ctx, dispose, yes):
+    model = add_openai(ctx)
     dlg = SavedPromptsDialog(ctx)
+    assert [dlg.provider_combo.itemData(i) for i in range(dlg.provider_combo.count())] == ["auto", model.id]
     count = dlg.prompt_list.count()
     dlg.new_prompt()
     dlg.save_prompt()  # empty name/text -> refused
     assert ctx.db.count_saved_prompts() == count
     dlg.name_edit.setText("My rename")
     dlg.prompt_edit.setPlainText("Add prefix X to everything")
-    dlg.provider_combo.setCurrentIndex(dlg.provider_combo.findData("openai"))
+    dlg.provider_combo.setCurrentIndex(dlg.provider_combo.findData(model.id))
     dlg.save_prompt()
     saved = next(p for p in ctx.db.list_saved_prompts() if p.name == "My rename")
-    assert saved.provider == "openai" and saved.prompt == "Add prefix X to everything" and saved.created_at
+    assert saved.provider == model.id and saved.prompt == "Add prefix X to everything" and saved.created_at
     assert dlg.created_label.text() == saved.created_at  # the created date is shown
     dlg.prompt_edit.setPlainText("Add prefix Y")
     dlg.save_prompt()
@@ -193,21 +200,25 @@ def test_header_has_prompts_history_undo_settings(window):
 def test_save_current_command_as_prompt(window, ctx, monkeypatch):
     monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("Quick prompt", True))
     window.command_panel.set_command("Add suffix _HD")
-    window.command_panel.set_provider("openai")
+    model = add_openai(ctx)
+    window.refresh_models_ui()
+    window.command_panel.set_model_choice(model.id)
     window.save_current_as_prompt()
     saved = next(p for p in ctx.db.list_saved_prompts() if p.name == "Quick prompt")
-    assert (saved.prompt, saved.provider) == ("Add suffix _HD", "openai")
+    assert (saved.prompt, saved.provider) == ("Add suffix _HD", model.id)
     assert any("Quick prompt" in a.text() for a in window.command_panel.prompts_menu.actions())
     assert "saved" in window.status_label.text()
 
 
-def test_saved_prompt_menu_fills_command_and_provider(window, ctx):
-    pid = ctx.db.add_saved_prompt("Zed", "Remove x264 from all filenames", "openai")
+def test_saved_prompt_menu_fills_command_and_model(window, ctx):
+    model = add_openai(ctx)
+    window.refresh_models_ui()
+    pid = ctx.db.add_saved_prompt("Zed", "Remove x264 from all filenames", "openai")  # value stored by older versions
     window.refresh_prompt_menus()
     action = next(a for a in window.command_panel.prompts_menu.actions() if a.text() == "⭐ Zed")
     action.trigger()
     assert window.command_panel.command() == "Remove x264 from all filenames"
-    assert window.command_panel.provider().value == "openai" and pid
+    assert window.command_panel.model_choice() == model.id and pid  # legacy "openai" -> first OpenAI model
 
 
 def test_history_dialog_undo_goes_through_the_main_window(window, history_ctx, workspace, monkeypatch):

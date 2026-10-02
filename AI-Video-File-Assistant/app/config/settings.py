@@ -13,12 +13,15 @@ from typing import TYPE_CHECKING, Any
 
 from app.config.constants import (
     DEFAULT_BATCH_SIZE,
-    DEFAULT_GEMINI_MODEL,
-    DEFAULT_OPENAI_MODEL,
+    DEFAULT_COOLDOWN_AFTER_FAILURES,
+    DEFAULT_COOLDOWN_S,
+    DEFAULT_MAX_FALLBACK_ATTEMPTS,
+    DEFAULT_MAX_REQUEST_CHARS,
+    DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT_S,
     DEFAULT_SAMPLE_SIZE,
     MAX_BATCH_SIZE,
-    Provider,
+    RoutingStrategy,
 )
 
 if TYPE_CHECKING:
@@ -28,25 +31,27 @@ if TYPE_CHECKING:
 THEMES = ("system", "dark", "light")
 LANGUAGES = ("en", "bn")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
-FALLBACK_MODES = ("automatic", "ask", "off")
+STRATEGIES = tuple(s.value for s in RoutingStrategy)
 DUPLICATE_POLICIES = ("flag", "number")
 DELETE_MODES = ("trash", "permanent")
 
-SECRET_GEMINI = "gemini_api_key"
-SECRET_OPENAI = "openai_api_key"
 
 
 @dataclass(slots=True)
 class AppSettings:
     """All user-configurable options with their defaults."""
 
-    # --- AI
-    gemini_model: str = DEFAULT_GEMINI_MODEL
-    openai_model: str = DEFAULT_OPENAI_MODEL
-    default_provider: str = Provider.GEMINI.value
-    auto_preferred_provider: str = Provider.GEMINI.value
-    fallback_mode: str = "automatic"
-    request_timeout_s: int = DEFAULT_REQUEST_TIMEOUT_S
+    # --- AI routing (the models themselves live in the Model Registry)
+    routing_strategy: str = RoutingStrategy.AUTO_FALLBACK.value
+    preferred_model_id: str = ""  # "" = automatic
+    cost_aware: bool = False
+    max_fallback_attempts: int = DEFAULT_MAX_FALLBACK_ATTEMPTS
+    cooldown_seconds: int = DEFAULT_COOLDOWN_S
+    cooldown_after_failures: int = DEFAULT_COOLDOWN_AFTER_FAILURES
+    health_tracking: bool = True
+    request_timeout_s: int = DEFAULT_REQUEST_TIMEOUT_S  # default for new model configurations
+    default_max_retries: int = DEFAULT_MAX_RETRIES  # default for new model configurations
+    max_request_chars: int = DEFAULT_MAX_REQUEST_CHARS
     batch_size: int = DEFAULT_BATCH_SIZE
     sample_size: int = DEFAULT_SAMPLE_SIZE
     use_offline_parser: bool = True
@@ -74,11 +79,12 @@ class AppSettings:
     def normalised(self) -> AppSettings:
         """Return a copy with every field coerced into its valid range."""
         out = replace(self)
-        out.default_provider = _choice(out.default_provider, [p.value for p in Provider], Provider.GEMINI.value)
-        out.auto_preferred_provider = _choice(
-            out.auto_preferred_provider, [Provider.GEMINI.value, Provider.OPENAI.value], Provider.GEMINI.value
-        )
-        out.fallback_mode = _choice(out.fallback_mode, FALLBACK_MODES, "automatic")
+        out.routing_strategy = _choice(out.routing_strategy, STRATEGIES, RoutingStrategy.AUTO_FALLBACK.value)
+        out.max_fallback_attempts = max(1, min(int(out.max_fallback_attempts), 10))
+        out.cooldown_seconds = max(10, min(int(out.cooldown_seconds), 3600))
+        out.cooldown_after_failures = max(1, min(int(out.cooldown_after_failures), 10))
+        out.default_max_retries = max(0, min(int(out.default_max_retries), 5))
+        out.max_request_chars = max(2_000, min(int(out.max_request_chars), 500_000))
         out.duplicate_policy = _choice(out.duplicate_policy, DUPLICATE_POLICIES, "flag")
         out.delete_mode = _choice(out.delete_mode, DELETE_MODES, "trash")
         out.theme = _choice(out.theme, THEMES, "system")
@@ -87,13 +93,8 @@ class AppSettings:
         out.batch_size = max(1, min(int(out.batch_size), MAX_BATCH_SIZE))
         out.sample_size = max(1, min(int(out.sample_size), MAX_BATCH_SIZE))
         out.request_timeout_s = max(5, min(int(out.request_timeout_s), 600))
-        out.gemini_model = out.gemini_model.strip() or DEFAULT_GEMINI_MODEL
-        out.openai_model = out.openai_model.strip() or DEFAULT_OPENAI_MODEL
         return out
 
-    def model_for(self, provider: str) -> str:
-        """The configured model name for ``provider``."""
-        return self.gemini_model if provider == Provider.GEMINI.value else self.openai_model
 
 
 def _choice(value: str, allowed: tuple[str, ...] | list[str], default: str) -> str:
@@ -161,29 +162,10 @@ class SettingsManager:
         """Convenience: change a few fields and save."""
         return self.save(replace(self.load(), **changes))
 
-    # ------------------------------------------------------------- API keys
-    def api_key(self, provider: str) -> str | None:
-        return self._secrets.get(self._secret_name(provider))
-
-    def has_api_key(self, provider: str) -> bool:
-        return self._secrets.has(self._secret_name(provider))
-
-    def set_api_key(self, provider: str, key: str) -> None:
-        self._secrets.set(self._secret_name(provider), key)
-
-    def remove_api_key(self, provider: str) -> None:
-        self._secrets.delete(self._secret_name(provider))
-
-    def masked_api_key(self, provider: str) -> str:
-        return self._secrets.masked(self._secret_name(provider))
-
-    @staticmethod
-    def _secret_name(provider: str) -> str:
-        if provider == Provider.GEMINI.value:
-            return SECRET_GEMINI
-        if provider == Provider.OPENAI.value:
-            return SECRET_OPENAI
-        raise ValueError(f"Unknown provider: {provider}")
+    @property
+    def secrets(self) -> SecretStore:
+        """The encrypted credential store (API keys live in the Model Registry, one per model)."""
+        return self._secrets
 
     # --------------------------------------------------------------- export
     def export_json(self) -> str:

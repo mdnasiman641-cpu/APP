@@ -1,11 +1,13 @@
 """From a natural-language command to a validated plan.
 
 1. *Offline first*: simple commands are recognised locally and cost nothing.
-2. Otherwise the AI is asked **once per batch**. If its answer to the first batch
-   consists of rule actions, those are applied to *all* selected files locally and
-   no further requests are made; only per-file (explicit) answers need follow-up
-   batches.
-3. The answer is parsed strictly, then turned into a plan by the planner.
+2. Otherwise the task is classified and the model router picks a suitable model.
+   The AI is asked **once per batch** (batches respect both "files per request"
+   and a payload-size budget). If its answer to the first batch consists of rule
+   actions, those are applied to *all* selected files locally and no further
+   requests are made; only per-file (explicit) answers need follow-up batches.
+3. Every answer is validated strictly (invalid JSON -> retry / next model; unsafe ->
+   stop), then turned into a plan by the planner.
 """
 
 from __future__ import annotations
@@ -15,13 +17,25 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.ai.ai_router import AIRouter, AllProvidersFailed, FallbackConfirm
-from app.ai.base_provider import AIRequest
+from app.ai.ai_router import (
+    InvalidAnswer,
+    ModelRouter,
+    NoModelsAvailable,
+    RouteResult,
+    UnsafeAnswer,
+)
+from app.ai.base_provider import AIResponse
 from app.ai.errors import ErrorKind
-from app.ai.prompt_builder import BatchInfo, build_request, split_batches
+from app.ai.prompt_builder import (
+    BatchInfo,
+    build_request,
+    estimate_request_chars,
+    split_batches,
+)
 from app.ai.response_parser import ResponseError, parse_response
 from app.ai.schemas import Action, ParsedResponse, RejectedAction
-from app.config.constants import ProcessingMode, Provider
+from app.ai.task_analyzer import TaskProfile, analyze_task
+from app.config.constants import ProcessingMode
 from app.config.settings import AppSettings
 from app.files.local_commands import parse_local_command
 from app.files.plan import Plan
@@ -32,11 +46,6 @@ from app.utils.logger import get_logger
 
 log = get_logger("pipeline")
 ProgressFn = Callable[[int, int, str], None]
-
-_RETRY_NOTE = (
-    "\n\nYour previous reply could not be used ({reason}). Reply again with ONLY the JSON object "
-    'described in the instructions: {{"actions": [...], "summary": "..."}}.'
-)
 
 
 class PipelineError(Exception):
@@ -60,7 +69,6 @@ class PipelineRequest:
     command: str
     files: list[FileEntry]
     workspace: Path
-    mode: Provider
     processing: ProcessingMode
     settings: AppSettings
 
@@ -71,11 +79,25 @@ class PipelineResult:
 
     plan: Plan
     source: str  # "offline" | "ai"
-    provider_text: str
-    provider_used: str  # "gemini" | "openai" | "offline"
+    provider_text: str  # e.g. "Gemini / gemini-2.5-flash ✓"
+    provider_used: str  # model label(s) or "offline"
     ai_requests: int = 0
+    fallbacks: int = 0
     summary: str = ""
+    task_type: str = ""
     warnings: list[str] = field(default_factory=list)
+    route_details: list[str] = field(default_factory=list)
+    files: int = 0
+
+    @property
+    def completion_text(self) -> str:
+        """``Completed · Model: Gemini / gemini-2.5-flash · Requests: 5 · Fallbacks: 1 · Files: 500``."""
+        if self.source == "offline":
+            return tr("pipeline.completed_offline", files=len({op.source for op in self.plan.ops if op.source}))
+        return tr(
+            "pipeline.completed", model=self.provider_used, requests=self.ai_requests, fallbacks=self.fallbacks,
+            files=self.files,
+        )  # fmt: skip
 
 
 def planner_options(settings: AppSettings) -> PlannerOptions:
@@ -87,13 +109,22 @@ def planner_options(settings: AppSettings) -> PlannerOptions:
     )
 
 
+def _validate(response: AIResponse) -> ParsedResponse:
+    """Router validator: structured output or a reason to retry / stop."""
+    try:
+        return parse_response(response.text)
+    except ResponseError as exc:
+        if exc.unsafe:
+            raise UnsafeAnswer(str(exc)) from exc
+        raise InvalidAnswer(str(exc)) from exc
+
+
 def run_pipeline(
     request: PipelineRequest,
-    router: AIRouter,
+    router: ModelRouter,
     *,
     cancel: threading.Event | None = None,
     progress: ProgressFn | None = None,
-    confirm_fallback: FallbackConfirm | None = None,
 ) -> PipelineResult:
     """Plan ``request.command`` for ``request.files`` (offline when possible, otherwise via the AI)."""
     cancel = cancel or threading.Event()
@@ -107,44 +138,50 @@ def run_pipeline(
         request.processing == ProcessingMode.AUTO and request.settings.use_offline_parser
     )
     local = parse_local_command(command) if use_local else None
-    warnings: list[str] = []
+    profile = analyze_task(command, len(request.files))
     if local is not None:
         parsed = ParsedResponse(actions=list(local.actions), summary=local.description)
-        source, provider_text, provider_used, requests = "offline", tr("pipeline.offline_used"), "offline", 0
         log.info("Command handled offline (%d actions, %d files)", len(parsed.actions), len(request.files))
+        result_meta = {"source": "offline", "provider_text": tr("pipeline.offline_used"), "provider_used": "offline",
+                       "ai_requests": 0, "fallbacks": 0, "route_details": []}  # fmt: skip
     elif request.processing == ProcessingMode.OFFLINE_ONLY:
         raise PipelineError(tr("pipeline.offline_cannot"))
     else:
-        parsed, provider_text, provider_used, requests = _ask_ai(request, command, router, cancel, progress, confirm_fallback)
-        source = "ai"
+        parsed, result_meta = _ask_ai(request, command, router, profile, cancel, progress)
 
-    warnings.extend(parsed.warnings)
     plan = Planner(request.workspace, request.files, planner_options(request.settings)).build(
         parsed.actions, parsed.rejected, summary=parsed.summary
     )
-    log.info("Pipeline done: source=%s provider=%s requests=%d ops=%d", source, provider_used, requests, len(plan.ops))
+    log.info(
+        "Pipeline done: source=%s model=%s task=%s requests=%s fallbacks=%s ops=%d",
+        result_meta["source"], result_meta["provider_used"], profile.task_type.value, result_meta["ai_requests"],
+        result_meta["fallbacks"], len(plan.ops),
+    )  # fmt: skip
     return PipelineResult(
-        plan=plan, source=source, provider_text=provider_text, provider_used=provider_used,
-        ai_requests=requests, summary=parsed.summary, warnings=warnings,
+        plan=plan, summary=parsed.summary, warnings=list(parsed.warnings), task_type=profile.task_type.value,
+        files=len(request.files), **result_meta,  # type: ignore[arg-type]
     )  # fmt: skip
 
 
 def _ask_ai(
     request: PipelineRequest,
     command: str,
-    router: AIRouter,
+    router: ModelRouter,
+    profile: TaskProfile,
     cancel: threading.Event,
     progress: ProgressFn | None,
-    confirm_fallback: FallbackConfirm | None,
-) -> tuple[ParsedResponse, str, str, int]:
+) -> tuple[ParsedResponse, dict[str, object]]:
     files = request.files
-    batches = split_batches(files, request.settings.batch_size)
+    batches = split_batches(files, request.settings.batch_size, request.settings.max_request_chars)
+    log.info(
+        "AI task %s: %d files in %d batch(es), ~%d chars", profile.task_type.value, len(files), len(batches),
+        estimate_request_chars(files),
+    )  # fmt: skip
     actions: list[Action] = []
     rejected: list[RejectedAction] = []
     warnings: list[str] = []
     summaries: list[str] = []
-    texts: list[str] = []
-    used: list[str] = []
+    routes: list[RouteResult] = []
     requests = 0
     explicit_only = False
     first_item = 1
@@ -162,12 +199,19 @@ def _ask_ai(
             explicit_only=explicit_only,
             include_metadata=request.settings.send_metadata_to_ai,
         )  # fmt: skip
-        parsed, route_text, provider, count = _request_once(ai_request, request.mode, router, confirm_fallback, cancel)
-        requests += count
-        if route_text not in texts:
-            texts.append(route_text)
-        if provider not in used:
-            used.append(provider)
+        try:
+            route = router.generate(ai_request, profile=profile, validate=_validate, cancel=cancel)
+        except UnsafeAnswer as exc:
+            raise PipelineError(tr("pipeline.unsafe", detail=str(exc)), unsafe=True) from exc
+        except NoModelsAvailable as exc:
+            if exc.kind == ErrorKind.CANCELLED or cancel.is_set():
+                raise PipelineCancelled from exc
+            raise PipelineError(exc.user_message, kind=exc.kind) from exc
+        if cancel.is_set():
+            raise PipelineCancelled
+        routes.append(route)
+        requests += len(route.attempts)
+        parsed: ParsedResponse = route.value
         if explicit_only:
             kept = [a for a in parsed.actions if not a.is_rule]
             if len(kept) != len(parsed.actions):
@@ -183,40 +227,19 @@ def _ask_ai(
         explicit_only = True
     if progress is not None:
         progress(len(batches), len(batches), tr("pipeline.planning"))
+    texts: list[str] = []
+    for route in routes:
+        if route.status_text not in texts:
+            texts.append(route.status_text)
+    used = list(dict.fromkeys(route.model.label for route in routes))
+    fallbacks = sum(route.fallbacks for route in routes)
     merged = ParsedResponse(actions=actions, summary=summaries[0] if summaries else "", rejected=rejected, warnings=warnings)
-    return merged, " · ".join(texts), "+".join(used), requests
-
-
-def _request_once(
-    ai_request: AIRequest,
-    mode: Provider,
-    router: AIRouter,
-    confirm_fallback: FallbackConfirm | None,
-    cancel: threading.Event,
-) -> tuple[ParsedResponse, str, str, int]:
-    """One batch: call the router, parse; retry once (same request + reminder) if the JSON is unusable."""
-    count = 0
-    current = ai_request
-    for attempt in (1, 2):
-        try:
-            route = router.generate(current, mode, confirm_fallback=confirm_fallback)
-        except AllProvidersFailed as exc:
-            raise PipelineError(exc.user_message, kind=exc.kind) from exc
-        count += 1
-        if cancel.is_set():
-            raise PipelineCancelled
-        try:
-            parsed = parse_response(route.response.text)
-        except ResponseError as exc:
-            if exc.unsafe:
-                log.warning("Unsafe AI answer rejected: %s", exc)
-                raise PipelineError(tr("pipeline.unsafe", detail=str(exc)), unsafe=True) from exc
-            if route.response.truncated:
-                raise PipelineError(tr("pipeline.truncated")) from exc
-            if attempt == 2:
-                raise PipelineError(tr("pipeline.invalid_json", detail=str(exc)), kind=ErrorKind.INVALID_RESPONSE) from exc
-            log.warning("Unusable AI answer (%s); retrying once", exc)
-            current = AIRequest(ai_request.system_prompt, ai_request.user_prompt + _RETRY_NOTE.format(reason=exc))
-            continue
-        return parsed, route.status_text, route.provider_used, count
-    raise AssertionError("unreachable")  # pragma: no cover
+    meta: dict[str, object] = {
+        "source": "ai",
+        "provider_text": " · ".join(texts),
+        "provider_used": ", ".join(used),
+        "ai_requests": requests,
+        "fallbacks": fallbacks,
+        "route_details": routes[-1].detail_lines() if routes else [],
+    }
+    return merged, meta

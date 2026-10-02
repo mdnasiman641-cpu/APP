@@ -26,7 +26,7 @@ from app.utils.logger import get_logger
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -69,6 +69,15 @@ CREATE TABLE IF NOT EXISTS operation_items (
     extra        TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_items_operation ON operation_items(operation_id, seq);
+CREATE TABLE IF NOT EXISTS model_configs (
+    id       TEXT PRIMARY KEY,
+    priority INTEGER NOT NULL,
+    data     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS model_health (
+    model_id TEXT PRIMARY KEY,
+    data     TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS metadata_cache (
     path     TEXT NOT NULL,
     size     INTEGER NOT NULL,
@@ -308,6 +317,35 @@ class Database:
             id=row["id"], created_at=row["created_at"], workspace=row["workspace"], command=row["command"],
             provider=row["provider"], status=row["status"], summary=row["summary"], undone_at=row["undone_at"],
         )  # fmt: skip
+
+    # --------------------------------------------------------- model registry
+    def list_model_rows(self) -> list[dict[str, object]]:
+        rows = self._connection().execute("SELECT data FROM model_configs ORDER BY priority, rowid").fetchall()
+        return [json.loads(r["data"]) for r in rows]
+
+    def replace_model_rows(self, rows: list[tuple[str, int, dict[str, object]]]) -> None:
+        """Atomically store the whole registry (``(id, priority, data)`` rows)."""
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM model_configs")
+            conn.executemany(
+                "INSERT INTO model_configs(id, priority, data) VALUES(?,?,?)",
+                [(model_id, priority, json.dumps(data, ensure_ascii=False)) for model_id, priority, data in rows],
+            )
+
+    def get_health_rows(self) -> dict[str, dict[str, object]]:
+        rows = self._connection().execute("SELECT model_id, data FROM model_health").fetchall()
+        return {r["model_id"]: json.loads(r["data"]) for r in rows}
+
+    def put_health_row(self, model_id: str, data: dict[str, object]) -> None:
+        self._connection().execute(
+            "INSERT OR REPLACE INTO model_health(model_id, data) VALUES(?,?)", (model_id, json.dumps(data))
+        )
+
+    def delete_health_row(self, model_id: str | None = None) -> None:
+        if model_id is None:
+            self._connection().execute("DELETE FROM model_health")
+        else:
+            self._connection().execute("DELETE FROM model_health WHERE model_id = ?", (model_id,))
 
     # -------------------------------------------------------- metadata cache
     def get_cached_metadata(self, path: str, size: int, mtime: float) -> dict[str, object] | None:

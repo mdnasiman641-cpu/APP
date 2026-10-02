@@ -1,4 +1,4 @@
-"""The "AI Command" card: provider, processing mode, command text and Generate Preview."""
+"""The "AI Command" card: AI mode (routing strategy), model, processing mode, command text and Generate Preview."""
 
 from __future__ import annotations
 
@@ -13,9 +13,16 @@ from PySide6.QtWidgets import (
     QToolButton,
 )
 
-from app.config.constants import MAX_PROMPT_CHARS, ProcessingMode, Provider
+from app.ai.model_registry import ModelRegistry
+from app.config.constants import MAX_PROMPT_CHARS, ProcessingMode, RoutingStrategy
 from app.database.models import CommandRecord, SavedPrompt
 from app.i18n import tr
+from app.ui.model_choice import (
+    AUTO,
+    fill_model_combo,
+    fill_strategy_combo,
+    resolve_model_choice,
+)
 from app.ui.widgets import Card, IconBinder, make_button
 from app.utils.helpers import truncate
 
@@ -41,20 +48,29 @@ class CommandPanel(Card):
     recent_command_chosen = Signal(object)  # CommandRecord
     manage_prompts_requested = Signal()
     save_prompt_requested = Signal()
+    routing_changed = Signal()  # AI mode or model changed by the user (auto-saved by the main window)
 
-    def __init__(self, icons: IconBinder) -> None:
+    def __init__(self, icons: IconBinder, registry: ModelRegistry | None = None) -> None:
         super().__init__("command.title")
         self._icons = icons
         self._busy = False
+        self._registry = registry
 
         row = QHBoxLayout()
         row.setSpacing(8)
-        self.provider_combo = QComboBox()
-        for provider in Provider:
-            self.provider_combo.addItem("", provider.value)
-        self.provider_combo.setMinimumWidth(130)
-        self._tr.tooltip(self.provider_combo, "command.provider_tip")
-        row.addWidget(self.provider_combo)
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.setMinimumWidth(150)
+        fill_strategy_combo(self.strategy_combo, RoutingStrategy.AUTO_FALLBACK.value)
+        self._tr.tooltip(self.strategy_combo, "command.strategy_tip")
+        self.strategy_combo.currentIndexChanged.connect(self._on_routing_changed)
+        row.addWidget(self.strategy_combo)
+
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(190)
+        self.model_combo.addItem(tr("models.automatic"), AUTO)
+        self._tr.tooltip(self.model_combo, "command.model_tip")
+        self.model_combo.currentIndexChanged.connect(self._on_routing_changed)
+        row.addWidget(self.model_combo)
 
         self.mode_combo = QComboBox()
         for mode in ProcessingMode:
@@ -112,6 +128,11 @@ class CommandPanel(Card):
         actions.addWidget(self.generate_button)
         self.body.addLayout(actions)
 
+        self.ai_label = QLabel()
+        self.ai_label.setObjectName("Muted")
+        self.ai_label.setWordWrap(True)
+        self.body.addWidget(self.ai_label)
+
         self.edit.textChanged.connect(self._update_counter)
         self.retranslate()
 
@@ -123,13 +144,40 @@ class CommandPanel(Card):
         self.edit.setPlainText(text)
         self.edit.setFocus()
 
-    def provider(self) -> Provider:
-        return Provider(self.provider_combo.currentData())
+    def strategy(self) -> RoutingStrategy:
+        return RoutingStrategy(self.strategy_combo.currentData())
 
-    def set_provider(self, provider: str) -> None:
-        index = self.provider_combo.findData(provider)
+    def set_strategy(self, value: str) -> None:
+        index = self.strategy_combo.findData(value)
         if index >= 0:
-            self.provider_combo.setCurrentIndex(index)
+            self.strategy_combo.blockSignals(True)
+            self.strategy_combo.setCurrentIndex(index)
+            self.strategy_combo.blockSignals(False)
+
+    def model_choice(self) -> str:
+        """``auto`` or the id of the chosen model configuration."""
+        return str(self.model_combo.currentData() or AUTO)
+
+    def set_model_choice(self, value: str | None) -> None:
+        """Select a model by id (legacy ``gemini`` / ``openai`` values map to the first such model)."""
+        choice = resolve_model_choice(self._registry, value) if self._registry is not None else AUTO
+        index = self.model_combo.findData(choice)
+        self.model_combo.blockSignals(True)
+        self.model_combo.setCurrentIndex(max(index, 0))
+        self.model_combo.blockSignals(False)
+
+    def refresh_models(self) -> None:
+        """Rebuild the Model combo from the registry (keeps the selection when it still exists)."""
+        if self._registry is not None:
+            fill_model_combo(self.model_combo, self._registry)
+
+    def set_ai_text(self, text: str) -> None:
+        """Show which model will be / was used (``AI: Gemini / gemini-2.5-flash``)."""
+        self.ai_label.setText(text)
+        self.ai_label.setVisible(bool(text))
+
+    def _on_routing_changed(self, *_args: object) -> None:
+        self.routing_changed.emit()
 
     def processing(self) -> ProcessingMode:
         return ProcessingMode(self.mode_combo.currentData())
@@ -139,7 +187,7 @@ class CommandPanel(Card):
         self._busy = busy
         self.generate_button.setVisible(not busy)
         self.cancel_button.setVisible(busy)
-        for widget in (self.provider_combo, self.mode_combo, self.edit):
+        for widget in (self.strategy_combo, self.model_combo, self.mode_combo, self.edit):
             widget.setEnabled(not busy)
 
     # ------------------------------------------------------------------ menus
@@ -173,9 +221,11 @@ class CommandPanel(Card):
 
     def retranslate(self) -> None:
         super().retranslate()
-        labels = {"gemini": "Gemini", "openai": "OpenAI", "auto": tr("settings.provider_auto")}
-        for index in range(self.provider_combo.count()):
-            self.provider_combo.setItemText(index, labels[str(self.provider_combo.itemData(index))])
+        fill_strategy_combo(self.strategy_combo)
+        if self._registry is not None:
+            fill_model_combo(self.model_combo, self._registry)
+        else:
+            self.model_combo.setItemText(0, tr("models.automatic"))
         modes = {"auto": tr("command.mode_auto"), "ai": tr("command.mode_ai"), "offline": tr("command.mode_offline")}
         for index in range(self.mode_combo.count()):
             self.mode_combo.setItemText(index, modes[str(self.mode_combo.itemData(index))])

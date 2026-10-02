@@ -20,10 +20,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config.constants import MAX_PROMPT_CHARS, Provider
+from app.config.constants import MAX_PROMPT_CHARS
 from app.context import AppContext
 from app.database.models import CommandRecord, SavedPrompt
 from app.i18n import tr
+from app.ui.model_choice import (
+    fill_model_combo,
+    model_choice_label,
+    resolve_model_choice,
+)
 from app.ui.widgets import Retranslator
 from app.utils.helpers import truncate
 
@@ -76,9 +81,8 @@ class SavedPromptsDialog(QDialog):
         form = QFormLayout()
         self.name_edit = QLineEdit()
         self.name_edit.setMaxLength(80)
-        self.provider_combo = QComboBox()
-        for provider in Provider:
-            self.provider_combo.addItem("", provider.value)
+        self.provider_combo = QComboBox()  # "Automatic" + the configured models
+        fill_model_combo(self.provider_combo, self.ctx.registry, "auto")
         self.prompt_edit = QPlainTextEdit()
         self.created_label = QLabel()
         self.created_label.setObjectName("Muted")
@@ -133,7 +137,7 @@ class SavedPromptsDialog(QDialog):
         self._current_prompt = prompt.id
         self.name_edit.setText(prompt.name)
         self.prompt_edit.setPlainText(prompt.prompt)
-        index = self.provider_combo.findData(prompt.provider)
+        index = self.provider_combo.findData(resolve_model_choice(self.ctx.registry, prompt.provider))
         self.provider_combo.setCurrentIndex(max(index, 0))
         self.created_label.setText(prompt.created_at)
         self.delete_button.setEnabled(True)
@@ -146,7 +150,7 @@ class SavedPromptsDialog(QDialog):
         self.prompt_list.blockSignals(False)
         self.name_edit.setText(truncate(text.strip().splitlines()[0], 40) if text.strip() else "")
         self.prompt_edit.setPlainText(text)
-        self.provider_combo.setCurrentIndex(max(self.provider_combo.findData(provider), 0))
+        self.provider_combo.setCurrentIndex(max(self.provider_combo.findData(resolve_model_choice(self.ctx.registry, provider)), 0))
         self.created_label.setText("—")
         self.delete_button.setEnabled(False)
         self.tabs.setCurrentIndex(0)
@@ -159,7 +163,7 @@ class SavedPromptsDialog(QDialog):
         if not name or not text:
             QMessageBox.warning(self, tr("prompts.title"), tr("prompts.need_name_and_text"))
             return
-        provider = str(self.provider_combo.currentData())
+        provider = str(self.provider_combo.currentData() or "auto")
         if self._current_prompt is None:
             self._current_prompt = self.ctx.db.add_saved_prompt(name, text, provider)
         else:
@@ -180,7 +184,7 @@ class SavedPromptsDialog(QDialog):
     def _use_prompt(self) -> None:
         text = self.prompt_edit.toPlainText().strip()
         if text:
-            self.use_requested.emit(text, str(self.provider_combo.currentData()))
+            self.use_requested.emit(text, str(self.provider_combo.currentData() or "auto"))
             self.accept()
 
     # ================================================================== history
@@ -217,7 +221,7 @@ class SavedPromptsDialog(QDialog):
         self.history_list.clear()
         for record in self._commands:
             item = QListWidgetItem(("★ " if record.favorite else "") + truncate(record.command.replace("\n", " "), 110))
-            item.setToolTip(f"{record.command}\n\n{record.created_at} · {record.provider}")
+            item.setToolTip(f"{record.command}\n\n{record.created_at} · {model_choice_label(self.ctx.registry, record.provider)}")
             self.history_list.addItem(item)
         if self._commands:
             self.history_list.setCurrentRow(0)
@@ -266,9 +270,7 @@ class SavedPromptsDialog(QDialog):
         self._provider_label.setText(tr("prompts.provider"))
         self._created_label.setText(tr("prompts.created"))
         self._prompt_label.setText(tr("prompts.prompt"))
-        labels = {"gemini": "Gemini", "openai": "OpenAI", "auto": tr("settings.provider_auto")}
-        for index in range(self.provider_combo.count()):
-            self.provider_combo.setItemText(index, labels[str(self.provider_combo.itemData(index))])
+        fill_model_combo(self.provider_combo, self.ctx.registry)
         for button, key in (
             (self.new_button, "prompts.new"), (self.save_button, "prompts.save"), (self.delete_button, "prompts.delete"),
             (self.use_button, "prompts.use"), (self.h_use, "prompts.use"), (self.h_fav, "prompts.favorite"),

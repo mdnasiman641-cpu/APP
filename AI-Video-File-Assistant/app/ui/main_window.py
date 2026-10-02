@@ -10,7 +10,9 @@ from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -24,9 +26,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.ai.ai_router import make_router
+from app.ai.ai_router import ModelRouter, make_router
 from app.ai.pipeline import PipelineRequest, PipelineResult
-from app.config.constants import APP_NAME, FileKind
+from app.ai.task_analyzer import analyze_task
+from app.config.constants import APP_NAME, FileKind, ProcessingMode
 from app.context import AppContext
 from app.database.models import CommandRecord, SavedPrompt
 from app.files.metadata import MetadataProbe, VideoMetadata
@@ -38,6 +41,8 @@ from app.i18n import set_language, tr
 from app.ui.command_panel import CommandPanel
 from app.ui.files_panel import FilesPanel
 from app.ui.history_window import HistoryDialog
+from app.ui.model_choice import AUTO
+from app.ui.model_dialog import ModelDialog
 from app.ui.preview_window import PreviewPanel
 from app.ui.saved_prompts_window import SavedPromptsDialog
 from app.ui.settings_window import SettingsDialog
@@ -105,7 +110,12 @@ class MainWindow(QMainWindow):
         self._restore_geometry()
         QApplication.instance().installEventFilter(self)  # type: ignore[union-attr]
         self.files_panel.set_filter(self.settings.default_file_filter)
-        self.command_panel.set_provider(self.settings.default_provider)
+        self.command_panel.set_strategy(self.settings.routing_strategy)
+        self.command_panel.refresh_models()
+        self.command_panel.set_model_choice(self.settings.preferred_model_id or AUTO)
+        self.command_panel.routing_changed.connect(self._on_routing_changed)
+        self.command_panel.mode_combo.currentIndexChanged.connect(lambda _i: self._update_ai_label())
+        self.refresh_models_ui()
         self.refresh_prompt_menus()
         self.refresh_undo_button()
         self.show_status(tr("status.ready"))
@@ -122,6 +132,8 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         layout.addLayout(self._build_header())
+        self.welcome = self._build_welcome()
+        layout.addWidget(self.welcome)
         self.folder_card = self._build_folder_card()
         layout.addWidget(self.folder_card)
 
@@ -132,7 +144,7 @@ class MainWindow(QMainWindow):
         self.files_panel.visible_rows_changed.connect(self._request_visible_metadata)
         self.files_panel.current_entry_changed.connect(self._on_current_entry)
         self.files_panel.details.set_capabilities(probe=self._probe.available, ffmpeg=self._thumbs.available)
-        self.command_panel = CommandPanel(self._icons)
+        self.command_panel = CommandPanel(self._icons, self.ctx.registry)
         self.command_panel.generate_requested.connect(self.generate_preview)
         self.command_panel.cancel_requested.connect(self.cancel_planning)
         self.command_panel.saved_prompt_chosen.connect(self._use_saved_prompt)
@@ -156,6 +168,28 @@ class MainWindow(QMainWindow):
         self.add_header_button("history", "history", "header.history", "header.history_tip", self.open_history)
         self.add_header_button("undo", "undo", "header.undo", "header.undo_tip", self.undo_last)
         self.add_header_button("settings", "settings", "header.settings", "header.settings_tip", self.open_settings)
+
+    def _build_welcome(self) -> QFrame:
+        """First-start banner, shown only while no AI model is configured."""
+        frame = QFrame()
+        frame.setObjectName("Card")
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(16, 12, 16, 12)
+        texts = QVBoxLayout()
+        title = QLabel()
+        title.setObjectName("CardTitle")
+        self._tr.text(title, "welcome.title")
+        body = QLabel()
+        body.setObjectName("Muted")
+        body.setWordWrap(True)
+        self._tr.text(body, "welcome.body")
+        texts.addWidget(title)
+        texts.addWidget(body)
+        row.addLayout(texts, 1)
+        self.welcome_button = make_button("models.add", self._tr, icon="settings", binder=self._icons, name="Primary")
+        self.welcome_button.clicked.connect(self.add_first_model)
+        row.addWidget(self.welcome_button)
+        return frame
 
     def _build_header(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -449,11 +483,17 @@ class MainWindow(QMainWindow):
 
     def _use_saved_prompt(self, prompt: SavedPrompt) -> None:
         self.command_panel.set_command(prompt.prompt)
-        self.command_panel.set_provider(prompt.provider)
+        self._choose_model(prompt.provider)
 
     def _use_recent_command(self, record: CommandRecord) -> None:
         self.command_panel.set_command(record.command)
-        self.command_panel.set_provider(record.provider)
+        self._choose_model(record.provider)
+
+    def _choose_model(self, value: str) -> None:
+        """Select the model a saved prompt / recent command asks for (``auto`` keeps the current choice)."""
+        if value and value != AUTO:
+            self.command_panel.set_model_choice(value)
+            self._on_routing_changed()
 
     def open_prompts(self, prefill: tuple[str, str] | None = None) -> None:
         """Saved Prompts / Command History dialog (``Use`` copies a command into the box)."""
@@ -466,7 +506,7 @@ class MainWindow(QMainWindow):
 
     def _on_prompt_used(self, text: str, provider: str) -> None:
         self.command_panel.set_command(text)
-        self.command_panel.set_provider(provider)
+        self._choose_model(provider)
 
     def save_current_as_prompt(self) -> None:
         """Quick-save the command in the box as a Saved Prompt (asks only for a name)."""
@@ -477,7 +517,7 @@ class MainWindow(QMainWindow):
         default_name = command.splitlines()[0][:40]
         name, ok = QInputDialog.getText(self, tr("prompts.title"), tr("command.prompt_name"), text=default_name)
         if ok and name.strip():
-            self.ctx.db.add_saved_prompt(name.strip(), command, self.command_panel.provider().value)
+            self.ctx.db.add_saved_prompt(name.strip(), command, self.command_panel.model_choice())
             self.refresh_prompt_menus()
             self.show_status(tr("status.prompt_saved", name=name.strip()), "success")
 
@@ -509,19 +549,23 @@ class MainWindow(QMainWindow):
         settings = self.ctx.settings.load()
         self.settings = settings
         request = PipelineRequest(
-            command=command, files=files, workspace=self.workspace, mode=self.command_panel.provider(),
-            processing=self.command_panel.processing(), settings=settings,
+            command=command, files=files, workspace=self.workspace, processing=self.command_panel.processing(),
+            settings=settings,
         )  # fmt: skip
         self._plan_generation += 1
         generation = self._plan_generation
         self._active_command = command
-        worker = PlanWorker(request, make_router(self.ctx.settings))
-        worker.signals.fallback_requested.connect(self._on_fallback_requested)  # type: ignore[attr-defined]
+        router = self.make_router()
+        self._update_ai_label(router, command, len(files))
+        worker = PlanWorker(request, router)
         self._plan_worker = worker
         self.command_panel.set_busy(True)
         self.preview_panel.clear()
         self.show_status(tr("status.planning"))
-        log.info("Generate preview: %d files, mode=%s, processing=%s", len(files), request.mode.value, request.processing.value)
+        log.info(
+            "Generate preview: %d files, strategy=%s, processing=%s", len(files), router.options.strategy.value,
+            request.processing.value,
+        )  # fmt: skip
         self.run_worker(
             worker,
             on_result=lambda res: self._on_plan_ready(generation, res),  # type: ignore[arg-type]
@@ -537,15 +581,50 @@ class MainWindow(QMainWindow):
             self.command_panel.set_busy(False)
             self.show_status(tr("status.planning_cancelled"))
 
-    def _on_fallback_requested(self, failed: str, reason: str, next_provider: str) -> None:
-        worker = self._plan_worker
-        if worker is None:
-            return
-        answer = QMessageBox.question(
-            self, APP_NAME, tr("ai.fallback_question", failed=failed, next=next_provider, reason=reason),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes,
+    # ================================================================== models
+    def make_router(self) -> ModelRouter:
+        """Router for the AI mode / model chosen in the command area."""
+        choice = self.command_panel.model_choice()
+        return make_router(
+            self.ctx.registry, self.ctx.health, self.ctx.settings.load(), strategy=self.command_panel.strategy(),
+            preferred_model_id="" if choice == AUTO else choice,
         )  # fmt: skip
-        worker.answer_fallback(answer == QMessageBox.StandardButton.Yes)
+
+    def _update_ai_label(self, router: ModelRouter | None = None, command: str = "", file_count: int = 0) -> None:
+        """``AI: Gemini / gemini-2.5-flash`` - the model the next request would start with."""
+        if self.command_panel.processing() == ProcessingMode.OFFLINE_ONLY:
+            self.command_panel.set_ai_text(tr("command.ai_offline"))
+            return
+        router = router or self.make_router()
+        profile = analyze_task(command, file_count) if command else None
+        model = router.preview(profile)
+        self.command_panel.set_ai_text(tr("command.ai_next", model=model.label) if model else tr("command.ai_none"))
+
+    def _on_routing_changed(self) -> None:
+        """AI mode / model changed in the command area: auto-save it (non-sensitive preference)."""
+        choice = self.command_panel.model_choice()
+        self.settings = self.ctx.settings.update(
+            routing_strategy=self.command_panel.strategy().value, preferred_model_id="" if choice == AUTO else choice
+        )
+        self._update_ai_label()
+
+    def refresh_models_ui(self) -> None:
+        """Models were added / edited / removed: update the combos, the welcome banner and the AI label."""
+        self.command_panel.refresh_models()
+        self.welcome.setVisible(len(self.ctx.registry) == 0)
+        self._update_ai_label()
+
+    def add_first_model(self) -> None:
+        """The welcome banner's *Add Model* button."""
+        settings = self.ctx.settings.load()
+        dialog = ModelDialog(
+            self.ctx.registry, None, self, default_timeout=settings.request_timeout_s,
+            default_retries=settings.default_max_retries,
+        )  # fmt: skip
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh_models_ui()
+            self.show_status(tr("models.saved", name=dialog.saved[0].display_name), "success")
+        dialog.deleteLater()
 
     def _on_plan_failed(self, generation: int, message: str) -> None:
         if generation != self._plan_generation:
@@ -554,6 +633,7 @@ class MainWindow(QMainWindow):
         self.command_panel.set_busy(False)
         self.preview_panel.clear()
         self.set_provider_text("")
+        self._update_ai_label()
         self._show_error(message)
 
     def _on_plan_cancelled(self, generation: int) -> None:
@@ -568,11 +648,16 @@ class MainWindow(QMainWindow):
         self._plan_worker = None
         self.command_panel.set_busy(False)
         plan = result.plan
-        self._active_provider = self.command_panel.provider().value
-        self.ctx.db.add_command(self._active_command, self._active_provider)
+        self._active_provider = result.provider_used
+        self.ctx.db.add_command(self._active_command, self.command_panel.model_choice())
         self.refresh_prompt_menus()
         self.set_provider_text(tr("status.provider", text=result.provider_text))
-        info = " — ".join(filter(None, [result.provider_text, plan.summary]))
+        if result.source == "ai":
+            self.command_panel.set_ai_text("   ".join([tr("command.ai_used", text=result.provider_text), *(
+                result.route_details if result.fallbacks else [])]))  # fmt: skip
+        else:
+            self.command_panel.set_ai_text(result.provider_text)
+        info = " — ".join(filter(None, [result.completion_text, plan.summary]))
         self.preview_panel.set_plan(plan, info)
         self._mark_file_statuses(plan)
         if plan.sort is not None:
@@ -783,8 +868,10 @@ class MainWindow(QMainWindow):
         """Show the Settings dialog and apply whatever the user changed."""
         dialog = SettingsDialog(self.ctx, self, self._icon_color)
         dialog.saved.connect(self._on_settings_saved)
+        dialog.models_changed.connect(self.refresh_models_ui)
         dialog.exec()
         dialog.deleteLater()
+        self.refresh_models_ui()
 
     def _on_settings_saved(self) -> None:
         previous = self.settings
@@ -802,8 +889,12 @@ class MainWindow(QMainWindow):
             setup_logging(self.settings.log_level)
         if self.settings.include_subfolders != previous.include_subfolders:
             self.subfolders_check.setChecked(self.settings.include_subfolders)  # triggers a rescan
-        if self.settings.default_provider != previous.default_provider:
-            self.command_panel.set_provider(self.settings.default_provider)
+        if (self.settings.routing_strategy, self.settings.preferred_model_id) != (
+            previous.routing_strategy, previous.preferred_model_id
+        ):  # fmt: skip
+            self.command_panel.set_strategy(self.settings.routing_strategy)
+            self.command_panel.set_model_choice(self.settings.preferred_model_id or AUTO)
+        self.refresh_models_ui()
         if (self.settings.ffmpeg_dir, self.settings.read_metadata) != (previous.ffmpeg_dir, previous.read_metadata):
             self._probe = MetadataProbe(self.settings.ffmpeg_dir)
             self._thumbs = ThumbnailCache(self.settings.ffmpeg_dir)
@@ -860,6 +951,7 @@ class MainWindow(QMainWindow):
         self.folder_card.retranslate()
         self.files_panel.retranslate()
         self.command_panel.retranslate()
+        self._update_ai_label()
         self.preview_panel.retranslate()
         self.refresh_prompt_menus()
         self.refresh_undo_button()

@@ -12,7 +12,13 @@ from app.context import AppContext
 from app.database.database import Database
 from app.utils import helpers
 from app.utils.logger import RedactingFilter
-from app.utils.security import KeyFileBackend, SecretStore, mask_key, redact, register_secret
+from app.utils.security import (
+    KeyFileBackend,
+    SecretStore,
+    mask_key,
+    redact,
+    register_secret,
+)
 
 
 @pytest.fixture
@@ -25,7 +31,8 @@ def test_settings_defaults_are_safe(ctx):
     assert s.auto_apply is False  # Auto Apply must be OFF by default
     assert s.ask_before_apply and s.prevent_overwrite and s.create_history
     assert s.include_subfolders is False
-    assert s.default_provider == "gemini" and s.language == "en"
+    assert s.routing_strategy == "auto_fallback" and s.preferred_model_id == "" and s.language == "en"
+    assert s.cost_aware is False and s.health_tracking is True and s.use_offline_parser is True
 
 
 def test_settings_roundtrip_and_normalisation(ctx):
@@ -33,35 +40,22 @@ def test_settings_roundtrip_and_normalisation(ctx):
     ctx.settings.reload()
     s = ctx.settings.load()
     assert (s.theme, s.batch_size, s.include_subfolders, s.language) == ("dark", 75, True, "bn")
-    ctx.settings.update(theme="neon", batch_size=99999, default_provider="skynet", fallback_mode="x")
+    ctx.settings.update(theme="neon", batch_size=99999, routing_strategy="skynet", max_fallback_attempts=500)
     s = ctx.settings.reload()
     assert s.theme == "system" and s.batch_size == 200
-    assert s.default_provider == "gemini" and s.fallback_mode == "automatic"
+    assert s.routing_strategy == "auto_fallback" and s.max_fallback_attempts == 10
 
 
-def test_models_are_configurable_not_hardcoded(ctx):
-    ctx.settings.update(gemini_model="my-gemini", openai_model="my-openai")
-    s = ctx.settings.reload()
-    assert s.model_for("gemini") == "my-gemini" and s.model_for("openai") == "my-openai"
-
-
-def test_api_keys_are_encrypted_at_rest(ctx):
-    ctx.settings.set_api_key("gemini", "AIzaSyDUMMYKEY1234567890abcdefghijklmn")
-    assert ctx.settings.has_api_key("gemini")
-    assert ctx.settings.api_key("gemini") == "AIzaSyDUMMYKEY1234567890abcdefghijklmn"
-    raw = ctx.db.get_raw("secret.gemini_api_key")
+def test_secret_store_encrypts_at_rest(ctx):
+    store = ctx.settings.secrets
+    store.set("model.abc", "AIzaSyDUMMYKEY1234567890abcdefghijklmn")
+    assert store.has("model.abc") and store.get("model.abc") == "AIzaSyDUMMYKEY1234567890abcdefghijklmn"
+    raw = ctx.db.get_raw("secret.model.abc")
     assert raw and "AIza" not in raw and "DUMMYKEY" not in raw
-    assert ctx.settings.masked_api_key("gemini") == "************klmn"
-    assert "secret.gemini_api_key" not in ctx.db.all_settings()  # secrets never listed with settings
+    assert "secret.model.abc" not in ctx.db.all_settings()  # secrets never listed with settings
     assert "AIza" not in ctx.settings.export_json()
-    ctx.settings.remove_api_key("gemini")
-    assert ctx.settings.api_key("gemini") is None and not ctx.settings.has_api_key("gemini")
-
-
-def test_blank_key_removes_it(ctx):
-    ctx.settings.set_api_key("openai", "sk-abcdefghijklmnop1234")
-    ctx.settings.set_api_key("openai", "   ")
-    assert not ctx.settings.has_api_key("openai")
+    store.delete("model.abc")
+    assert store.get("model.abc") is None and not store.has("model.abc")
 
 
 def test_mask_never_reveals_short_keys():

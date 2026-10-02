@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 
 import pytest
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QLabel, QMessageBox
 
-from app.ai import gemini_provider, openai_provider
-from app.config.constants import ProcessingMode
+from app.ai.model_config import ModelConfig
+from app.config.constants import ProcessingMode, RoutingStrategy
 from app.context import AppContext
 from app.i18n import set_language
 from app.ui.main_window import MainWindow
@@ -49,11 +49,25 @@ def dialogs(monkeypatch):
 
 
 @pytest.fixture
-def server(monkeypatch):
+def server():
     with FakeAIServer() as srv:
-        monkeypatch.setattr(gemini_provider, "GEMINI_API_BASE", srv.base)
-        monkeypatch.setattr(openai_provider, "OPENAI_API_BASE", srv.base)
         yield srv
+
+
+def add_gemini(ctx, server, window=None, **kw) -> ModelConfig:
+    """A Gemini model configuration pointed at the fake server (no real key needed)."""
+    model = ctx.registry.add(ModelConfig.new("gemini", "gemini-test", base_url=server.base, max_retries=0, **kw),
+                             "AIzaSyKEY-1234567890-abcdefghijklmn")  # fmt: skip
+    if window is not None:
+        window.refresh_models_ui()
+    return model
+
+
+def add_openai(ctx, server, window=None, **kw) -> ModelConfig:
+    model = ctx.registry.add(ModelConfig.new("openai", "gpt-test", base_url=server.base, max_retries=0, **kw), "sk-test-1234567890abcdefgh")
+    if window is not None:
+        window.refresh_models_ui()
+    return model
 
 
 @pytest.fixture
@@ -194,7 +208,7 @@ def test_discarding_the_preview_clears_marks(window, workspace, make_files):
 def test_delete_always_needs_the_extra_confirmation(window, app_ctx, workspace, make_files, dialogs, server):
     app_ctx.settings.update(ask_before_apply=False)
     window.settings = app_ctx.settings.load()
-    app_ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
+    add_gemini(app_ctx, server, window)
     make_files("keep.mp4", "junk.mp4")
     open_folder(window, workspace, 2)
     server.queue(200, gemini_ok(json.dumps({"actions": [{"type": "delete", "source": "junk.mp4"}], "summary": "Delete junk"})))
@@ -213,7 +227,7 @@ def test_delete_always_needs_the_extra_confirmation(window, app_ctx, workspace, 
 
 def test_delete_dialog_wording_in_permanent_mode(window, app_ctx, workspace, make_files, dialogs, server):
     app_ctx.settings.update(delete_mode="permanent")
-    app_ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
+    add_gemini(app_ctx, server, window)
     make_files("junk.mp4")
     open_folder(window, workspace, 1)
     server.queue(200, gemini_ok(json.dumps({"actions": [{"type": "delete", "source": "junk.mp4"}]})))
@@ -224,13 +238,14 @@ def test_delete_dialog_wording_in_permanent_mode(window, app_ctx, workspace, mak
 
 # ---------------------------------------------------------------- AI path
 def test_ai_rule_answer_with_gemini(window, app_ctx, workspace, make_files, dialogs, server):
-    app_ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
+    add_gemini(app_ctx, server, window)
     make_files(*SAMPLE)
     open_folder(window, workspace, 3)
     answer = {"actions": [{"type": "numbering", "start": 1, "width": 2, "position": "replace", "template": "Blue Bloods - Episode {n}"}], "summary": "Rename to Blue Bloods - Episode NN"}
     server.queue(200, gemini_ok(json.dumps(answer)))
     generate(window, "Clean these filenames and rename them sequentially as Blue Bloods Episode 01, 02 and 03. Keep the .mp4 extension.")
-    assert len(server.requests) == 1 and "Gemini ✓" in window.provider_label.text()
+    assert len(server.requests) == 1 and "Gemini / gemini-test ✓" in window.provider_label.text()
+    assert "Completed · Model: Gemini / gemini-test · Requests: 1 · Fallbacks: 0 · Files: 3" in window.preview_panel.info.text()
     assert "Rename to Blue Bloods" in window.preview_panel.info.text()
     window.apply_changes()
     assert wait_until(lambda: names(workspace) == [f"Blue Bloods - Episode 0{i}.mp4" for i in (1, 2, 3)])
@@ -238,14 +253,14 @@ def test_ai_rule_answer_with_gemini(window, app_ctx, workspace, make_files, dial
 
 
 def test_ai_explicit_renames_with_openai(window, app_ctx, workspace, make_files, server):
-    app_ctx.settings.set_api_key("openai", "sk-test-1234567890abcdefgh")
+    openai_model = add_openai(app_ctx, server, window)
     make_files(*SAMPLE)
     open_folder(window, workspace, 3)
     actions = [{"type": "rename", "source": s, "target": f"Blue Bloods - Episode 0{i}.mp4"} for i, s in enumerate(SAMPLE, 1)]
     server.queue(200, openai_ok(json.dumps({"actions": actions})))
-    window.command_panel.set_provider("openai")
+    window.command_panel.set_model_choice(openai_model.id)
     generate(window, "give them proper titles")
-    assert "OpenAI ✓" in window.provider_label.text() and window.preview_panel.apply_count() == 3
+    assert "OpenAI / gpt-test ✓" in window.provider_label.text() and window.preview_panel.apply_count() == 3
     assert server.requests[0]["path"] == "/chat/completions"
 
 
@@ -258,17 +273,17 @@ def test_missing_key_gives_actionable_error(window, workspace, make_files, dialo
 
 
 def test_api_failure_message_and_state_reset(window, app_ctx, workspace, make_files, dialogs, server):
-    app_ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
+    add_gemini(app_ctx, server, window)
     make_files("a.mp4")
     open_folder(window, workspace, 1)
     server.queue(429, {"error": {"message": "quota"}})
     generate(window, "make them look professional")
-    assert "Gemini request failed." in dialogs.warnings[-1] and "Rate limit" in dialogs.warnings[-1]
+    assert "Gemini / gemini-test" in dialogs.warnings[-1] and "Rate limit" in dialogs.warnings[-1]
     assert window.command_panel.generate_button.isVisible() and not window.command_panel.cancel_button.isVisible()
 
 
 def test_unsafe_ai_answer_is_blocked_and_files_untouched(window, app_ctx, workspace, make_files, dialogs, server):
-    app_ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
+    add_gemini(app_ctx, server, window)
     make_files("a.mp4")
     open_folder(window, workspace, 1)
     server.queue(200, gemini_ok(json.dumps({"actions": [{"type": "powershell", "script": "Remove-Item C:\\ -Recurse -Force"}]})))
@@ -277,48 +292,86 @@ def test_unsafe_ai_answer_is_blocked_and_files_untouched(window, app_ctx, worksp
     assert window.preview_panel.plan is None and names(workspace) == ["a.mp4"]
 
 
-def test_auto_mode_fallback_automatic(window, app_ctx, workspace, make_files, server):
-    app_ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
-    app_ctx.settings.set_api_key("openai", "sk-test-1234567890abcdefgh")
+def test_auto_fallback_switches_model_and_shows_it(window, app_ctx, workspace, make_files, server):
+    add_gemini(app_ctx, server, window)
+    add_openai(app_ctx, server, window)
     make_files("a.mp4")
     open_folder(window, workspace, 1)
-    server.queue(500, {"error": {"message": "boom"}})
+    server.queue(429, {"error": {"message": "quota exceeded"}})
     server.queue(200, openai_ok(json.dumps({"actions": [{"type": "rename", "source": "a.mp4", "target": "b.mp4"}]})))
-    window.command_panel.set_provider("auto")
     generate(window, "complex request")
-    assert "Gemini failed → OpenAI fallback ✓" in window.provider_label.text()
-    assert [r["path"] for r in server.requests] == [f"/models/{app_ctx.settings.load().gemini_model}:generateContent", "/chat/completions"]
+    assert "Gemini / gemini-test (HTTP 429) → OpenAI / gpt-test ✓" in window.provider_label.text()
+    assert [r["path"] for r in server.requests] == ["/models/gemini-test:generateContent", "/chat/completions"]
+    details = window.command_panel.ai_label.text()
+    for line in ("Primary: Gemini / gemini-test", "Failed: Gemini / gemini-test (HTTP 429)", "Fallback: OpenAI / gpt-test", "Success ✓"):
+        assert line in details
+    assert "Fallbacks: 1" in window.preview_panel.info.text() and window.preview_panel.apply_count() == 1
+    assert app_ctx.health.in_cooldown(app_ctx.registry.list()[0].id)  # the rate-limited model rests for a while
 
 
-def test_auto_mode_fallback_ask_user_declines(window, app_ctx, workspace, make_files, server, dialogs):
-    app_ctx.settings.update(fallback_mode="ask")
-    app_ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
-    app_ctx.settings.set_api_key("openai", "sk-test-1234567890abcdefgh")
+def test_manual_mode_never_falls_back(window, app_ctx, workspace, make_files, server, dialogs):
+    gem = add_gemini(app_ctx, server, window)
+    add_openai(app_ctx, server, window)
     make_files("a.mp4")
     open_folder(window, workspace, 1)
+    window.command_panel.set_strategy(RoutingStrategy.MANUAL.value)
+    window.command_panel.set_model_choice(gem.id)
     server.queue(500, {"error": {"message": "boom"}})
-    dialogs.question_answer = QMessageBox.StandardButton.No
-    window.command_panel.set_provider("auto")
     generate(window, "complex request")
-    assert dialogs.questions and "Try OpenAI instead?" in dialogs.questions[0]
     assert len(server.requests) == 1 and dialogs.warnings  # never silently switched
 
 
-def test_auto_mode_fallback_ask_user_accepts(window, app_ctx, workspace, make_files, server, dialogs):
-    app_ctx.settings.update(fallback_mode="ask")
-    app_ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
-    app_ctx.settings.set_api_key("openai", "sk-test-1234567890abcdefgh")
-    make_files("a.mp4")
-    open_folder(window, workspace, 1)
-    server.queue(500, {"error": {"message": "boom"}})
-    server.queue(200, openai_ok(json.dumps({"actions": [{"type": "rename", "source": "a.mp4", "target": "b.mp4"}]})))
-    window.command_panel.set_provider("auto")
-    generate(window, "complex request")
-    assert window.preview_panel.apply_count() == 1
+def test_ai_label_shows_next_model_and_choice_is_remembered(window, app_ctx, server):
+    assert "no usable model" in window.command_panel.ai_label.text()
+    gem = add_gemini(app_ctx, server, window)
+    oai = add_openai(app_ctx, server, window)
+    assert window.command_panel.ai_label.text() == "AI: Gemini / gemini-test"
+    assert [window.command_panel.model_combo.itemData(i) for i in range(3)] == ["auto", gem.id, oai.id]
+    window.command_panel.model_combo.setCurrentIndex(2)  # user picks OpenAI
+    assert window.command_panel.ai_label.text() == "AI: OpenAI / gpt-test"
+    window.command_panel.strategy_combo.setCurrentIndex(window.command_panel.strategy_combo.findData("fastest"))
+    saved = app_ctx.settings.reload()
+    assert (saved.preferred_model_id, saved.routing_strategy) == (oai.id, "fastest")  # auto-saved
+    window.command_panel.mode_combo.setCurrentIndex(window.command_panel.mode_combo.findData("offline"))
+    assert "offline" in window.command_panel.ai_label.text()
+
+
+def test_routing_choice_restored_on_restart(qapp, tmp_path, server, dispose):
+    ctx = AppContext.create(tmp_path / "restart")
+    oai = add_openai(ctx, server)
+    ctx.settings.update(routing_strategy="cheapest", preferred_model_id=oai.id)
+    win = MainWindow(AppContext.create(tmp_path / "restart"))
+    try:
+        assert win.command_panel.strategy().value == "cheapest" and win.command_panel.model_choice() == oai.id
+        assert not win.welcome.isVisibleTo(win)
+    finally:
+        dispose(win)
+
+
+def test_welcome_banner_only_without_models(window, app_ctx, server, monkeypatch):
+    assert window.welcome.isVisibleTo(window)
+    assert "Welcome to AI Video File Assistant" in [w.text() for w in window.welcome.findChildren(QLabel)]
+    from app.ui import main_window as mw
+
+    class FakeDialog:
+        DialogCode = mw.QDialog.DialogCode
+
+        def __init__(self, registry, *_a, **_k):
+            self.saved = [add_gemini(app_ctx, server)]
+
+        def exec(self):
+            return mw.QDialog.DialogCode.Accepted
+
+        def deleteLater(self):
+            pass
+
+    monkeypatch.setattr(mw, "ModelDialog", FakeDialog)
+    window.welcome_button.click()
+    assert not window.welcome.isVisibleTo(window) and window.command_panel.model_combo.count() == 2
 
 
 def test_cancel_while_waiting_for_the_ai(window, app_ctx, workspace, make_files, server):
-    app_ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
+    add_gemini(app_ctx, server, window)
     make_files("a.mp4")
     open_folder(window, workspace, 1)
     server.queue(200, gemini_ok('{"actions":[{"type":"rename","source":"a.mp4","target":"late.mp4"}]}'), delay=1.2)
@@ -351,7 +404,7 @@ def test_auto_apply_applies_safe_plans_without_asking(window, app_ctx, workspace
 def test_auto_apply_never_applies_deletes_or_conflicts(window, app_ctx, workspace, make_files, dialogs, server):
     app_ctx.settings.update(auto_apply=True)
     window.settings = app_ctx.settings.load()
-    app_ctx.settings.set_api_key("gemini", "AIzaSyKEY-1234567890-abcdefghijklmn")
+    add_gemini(app_ctx, server, window)
     make_files("a.mp4", "junk.mp4")
     open_folder(window, workspace, 2)
     server.queue(200, gemini_ok(json.dumps({"actions": [{"type": "delete", "source": "junk.mp4"}]})))
