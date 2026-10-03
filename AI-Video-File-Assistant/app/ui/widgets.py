@@ -9,6 +9,7 @@ from PySide6.QtCore import QEvent, QObject, QSize, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -182,4 +183,11 @@ def fit_to_screen(widget: QWidget, width: int, height: int) -> None:
         area = screen.availableGeometry()
         w, h = min(w, int(area.width() * 0.9)), min(h, int(area.height() * 0.9))
     widget.resize(w, h)
+
+
+def make_compact(combo: QComboBox, chars: int = 6) -> None:
+    """Let a combo box shrink below its longest entry on small windows (the popup still shows full text)."""
+    combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    combo.setMinimumContentsLength(chars)
+    combo.setMinimumWidth(0)
 

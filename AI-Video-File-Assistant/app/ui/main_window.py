@@ -10,9 +10,11 @@ from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -49,7 +51,7 @@ from app.ui.preview_window import PreviewPanel
 from app.ui.saved_prompts_window import SavedPromptsDialog
 from app.ui.settings_window import SettingsDialog
 from app.ui.theme import PALETTES, apply_theme, resolve_theme
-from app.ui.widgets import Card, IconBinder, Retranslator, make_button
+from app.ui.widgets import Card, IconBinder, Retranslator, make_button, make_compact
 from app.utils.helpers import classify_extension, resource_path
 from app.utils.logger import get_logger, setup_logging
 from app.workers.ai_worker import PlanWorker
@@ -179,6 +181,10 @@ class MainWindow(QMainWindow):
         page_layout.addWidget(self.files_panel, 3)
         page_layout.addWidget(self.command_panel, 0)
         page_layout.addWidget(self.preview_panel, 3)
+        for combo in self.page.findChildren(QComboBox):  # dropdowns may shrink on small windows
+            make_compact(combo)
+        make_compact(self.files_panel.filter_combo, 7)  # these two have no stretch: keep their labels readable
+        make_compact(self.files_panel.sort_combo, 10)
         self._fit_sections()
 
         self._build_status_bar()
@@ -201,6 +207,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "scroll"):
             self.title_panel.set_available_width(self.scroll.viewport().width())
             self.command_panel.set_available_width(self.scroll.viewport().width())
+            self._place_folder_row(narrow=self.scroll.viewport().width() < 900)
         self.files_panel.setMinimumHeight(max(360, int(available * 0.62)))
         self.preview_panel.setMinimumHeight(max(380, int(available * 0.62)))
 
@@ -252,6 +259,11 @@ class MainWindow(QMainWindow):
         card = Card("folder.title")
         row = QHBoxLayout()
         row.setSpacing(8)
+        self._folder_grid = QGridLayout()
+        self._folder_grid.setHorizontalSpacing(12)
+        self._folder_grid.setVerticalSpacing(8)
+        self._folder_row = row
+        self._folder_narrow: bool | None = None
         self.folder_edit = QLineEdit()
         self.folder_edit.setClearButtonEnabled(True)
         self.folder_edit.setAcceptDrops(False)  # drops are handled by the window
@@ -272,9 +284,22 @@ class MainWindow(QMainWindow):
         self._tr.tooltip(self.subfolders_check, "folder.subfolders_tip")
         self.subfolders_check.setChecked(self.settings.include_subfolders)
         self.subfolders_check.toggled.connect(self._on_subfolders_toggled)
-        row.addWidget(self.subfolders_check)
-        card.body.addLayout(row)
+        self._place_folder_row(narrow=False)
+        card.body.addLayout(self._folder_grid)
         return card
+
+    def _place_folder_row(self, *, narrow: bool) -> None:
+        """'Include subfolders' sits beside the buttons, or below the path on narrow windows."""
+        if narrow == self._folder_narrow:
+            return
+        self._folder_narrow = narrow
+        self._folder_grid.removeItem(self._folder_row)
+        self._folder_grid.removeWidget(self.subfolders_check)
+        self._folder_grid.addLayout(self._folder_row, 0, 0)
+        if narrow:
+            self._folder_grid.addWidget(self.subfolders_check, 1, 0)
+        else:
+            self._folder_grid.addWidget(self.subfolders_check, 0, 1)
 
     def _build_status_bar(self) -> None:
         bar = self.statusBar()

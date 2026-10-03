@@ -69,14 +69,12 @@ class CommandPanel(Card):
         tools = QHBoxLayout()  # Saved Prompts · Recent (moves below the selectors on narrow windows)
         tools.setSpacing(6)
         self.strategy_combo = QComboBox()
-        self.strategy_combo.setMinimumWidth(140)
         fill_strategy_combo(self.strategy_combo, RoutingStrategy.AUTO_FALLBACK.value)
         self._tr.tooltip(self.strategy_combo, "command.strategy_tip")
         self.strategy_combo.currentIndexChanged.connect(self._on_routing_changed)
         row.addWidget(self.strategy_combo, 2)
 
         self.model_combo = QComboBox()
-        self.model_combo.setMinimumWidth(160)
         self.model_combo.addItem(tr("models.automatic"), AUTO)
         self._tr.tooltip(self.model_combo, "command.model_tip")
         self.model_combo.currentIndexChanged.connect(self._on_routing_changed)
@@ -85,7 +83,6 @@ class CommandPanel(Card):
         self.mode_combo = QComboBox()
         for mode in ProcessingMode:
             self.mode_combo.addItem("", mode.value)
-        self.mode_combo.setMinimumWidth(180)
         self._tr.tooltip(self.mode_combo, "command.mode_tip")
         row.addWidget(self.mode_combo, 3)
         for combo in (self.strategy_combo, self.model_combo, self.mode_combo):

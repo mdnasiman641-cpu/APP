@@ -251,6 +251,9 @@ class TitlePanel(QWidget):
         for i, box in enumerate(boxes):  # one row on wide windows, stacked on narrow ones
             self.checks_grid.addWidget(box, *((0, i) if columns == 2 else (i, 0)))
         self.checks_grid.setColumnStretch(3, 1)
+        if hasattr(self, "preset_grid"):  # preset buttons beside the list, or below it on narrow windows
+            self.preset_grid.removeItem(self.preset_buttons)
+            self.preset_grid.addLayout(self.preset_buttons, *((0, 1) if columns == 2 else (1, 0)))
 
     def set_available_width(self, width: int) -> None:
         """Called by the main window with the page width: two columns only when there is room for them."""
@@ -290,8 +293,10 @@ class TitlePanel(QWidget):
         top.addWidget(self.query_mode, 1)
         top.addWidget(self._label("tg.max_results"))
         top.addWidget(self.max_results)
-        top.addWidget(self.clear_cache_button)
         form.addRow(self._label("tg.query_mode"), top)
+        cache_row = QHBoxLayout()
+        cache_row.addStretch(1)
+        cache_row.addWidget(self.clear_cache_button)
         form.addRow(self._label("tg.custom_query"), self.custom_query)
         boxes = QGridLayout()
         boxes.setHorizontalSpacing(18)
@@ -301,6 +306,7 @@ class TitlePanel(QWidget):
             boxes.addWidget(box, i // 2, i % 2)
         form.addRow(boxes)
         form.addRow(self.search_hint)
+        form.addRow(cache_row)
         return self.search_box
 
     def _build_presets(self) -> QVBoxLayout:
@@ -310,8 +316,9 @@ class TitlePanel(QWidget):
         row.setSpacing(10)
         row.addWidget(self._label("tg.preset"))
         self.preset_combo = QComboBox()
-        self.preset_combo.setMinimumWidth(140)
         row.addWidget(self.preset_combo, 1)
+        self.preset_buttons = QHBoxLayout()
+        self.preset_buttons.setSpacing(10)
         self.save_preset_button = QPushButton()
         self.load_preset_button = QPushButton()
         self.delete_preset_button = QPushButton()
@@ -321,11 +328,17 @@ class TitlePanel(QWidget):
                                      (self.delete_preset_button, "tg.delete_preset", self.delete_preset)):  # fmt: skip
             self._tr.text(button, key)
             button.clicked.connect(handler)
-            row.addWidget(button)
+            self.preset_buttons.addWidget(button)
+        self.preset_grid = QGridLayout()
+        self.preset_grid.setHorizontalSpacing(10)
+        self.preset_grid.setVerticalSpacing(8)
+        self._preset_row = row
         self.preset_status = QLabel()
         self.preset_status.setObjectName("Muted")
         self.preset_status.setWordWrap(True)
-        outer.addLayout(row)
+        self.preset_grid.addLayout(row, 0, 0)
+        self.preset_grid.addLayout(self.preset_buttons, 0, 1)
+        outer.addLayout(self.preset_grid)
         outer.addWidget(self.preset_status)
         return outer
 

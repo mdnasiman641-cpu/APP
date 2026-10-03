@@ -94,7 +94,7 @@ class FilesPanel(Card):
         search_action = self.search.addAction(QIcon(), QLineEdit.ActionPosition.LeadingPosition)
         self._icons.bind(search_action.setIcon, "search", 16)
         self.search.textChanged.connect(self._on_search)
-        self.search.setMinimumWidth(180)
+        self.search.setMinimumWidth(100)
         row.addWidget(self.search, 1)
 
         self.filter_combo = QComboBox()
