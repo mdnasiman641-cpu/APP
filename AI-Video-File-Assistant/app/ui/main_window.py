@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QSplitter,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -97,7 +97,7 @@ class MainWindow(QMainWindow):
         self._icons = IconBinder(self._icon_color)
 
         self._tr.title(self, "app.title")
-        self.setMinimumSize(980, 680)
+        self.setMinimumSize(760, 520)  # smaller windows simply scroll
         screen = QApplication.primaryScreen().availableGeometry() if QApplication.primaryScreen() else None
         self.resize(
             min(1280, int(screen.width() * 0.94)) if screen else 1240,
@@ -135,13 +135,27 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         layout.addLayout(self._build_header())
-        self.welcome = self._build_welcome()
-        layout.addWidget(self.welcome)
-        self.folder_card = self._build_folder_card()
-        layout.addWidget(self.folder_card)
 
-        self.splitter = QSplitter(Qt.Orientation.Vertical)
-        self.splitter.setChildrenCollapsible(False)
+        # One natural vertical page scroll for every section (the header and status bar stay fixed).
+        self.page = QWidget()
+        self.page.setObjectName("Root")
+        page_layout = QVBoxLayout(self.page)
+        page_layout.setContentsMargins(0, 0, 6, 4)
+        page_layout.setSpacing(14)
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("PageScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll.setWidget(self.page)
+        self.scroll.viewport().installEventFilter(self)
+        layout.addWidget(self.scroll, 1)
+
+        self.welcome = self._build_welcome()
+        page_layout.addWidget(self.welcome)
+        self.folder_card = self._build_folder_card()
+        page_layout.addWidget(self.folder_card)
         self.files_panel = FilesPanel(self._icons)
         self.files_panel.selection_changed.connect(self._on_selection_changed)
         self.files_panel.visible_rows_changed.connect(self._request_visible_metadata)
@@ -162,19 +176,32 @@ class MainWindow(QMainWindow):
         self.preview_panel.set_palette(self._palette)
         self.preview_panel.apply_requested.connect(self.apply_changes)
         self.preview_panel.cancel_requested.connect(self.clear_preview)
-        for panel in (self.files_panel, self.command_panel, self.preview_panel):
-            self.splitter.addWidget(panel)
-        self.splitter.setStretchFactor(0, 3)
-        self.splitter.setStretchFactor(1, 0)
-        self.splitter.setStretchFactor(2, 3)
-        self.splitter.setSizes([280, 190, 260])
-        layout.addWidget(self.splitter, 1)
+        page_layout.addWidget(self.files_panel, 3)
+        page_layout.addWidget(self.command_panel, 0)
+        page_layout.addWidget(self.preview_panel, 3)
+        self._fit_sections()
 
         self._build_status_bar()
         self.add_header_button("prompts", "star", "header.prompts", "header.prompts_tip", self.open_prompts)
         self.add_header_button("history", "history", "header.history", "header.history_tip", self.open_history)
         self.add_header_button("undo", "undo", "header.undo", "header.undo_tip", self.undo_last)
         self.add_header_button("settings", "settings", "header.settings", "header.settings_tip", self.open_settings)
+
+    def reveal_preview(self) -> None:
+        """Scroll the page so the top of the Preview card is visible."""
+        self.scroll.ensureWidgetVisible(self.preview_panel.title_label, 0, 24)
+
+    def _fit_sections(self) -> None:
+        """Give the Files and Preview cards a height that follows the window (more rows on big screens).
+
+        The page itself scrolls, so nothing is ever squeezed out of reach on small windows; the
+        tables keep their own scroll bar only for long file lists.
+        """
+        available = self.scroll.viewport().height() if hasattr(self, "scroll") else 700
+        if hasattr(self, "scroll"):
+            self.title_panel.set_available_width(self.scroll.viewport().width())
+        self.files_panel.setMinimumHeight(max(360, int(available * 0.62)))
+        self.preview_panel.setMinimumHeight(max(380, int(available * 0.62)))
 
     def _build_welcome(self) -> QFrame:
         """First-start banner, shown only while no AI model is configured."""
@@ -676,6 +703,7 @@ class MainWindow(QMainWindow):
             self.command_panel.set_ai_text(result.provider_text)
         info = " — ".join(filter(None, [result.completion_text, plan.summary]))
         self.preview_panel.set_plan(plan, info)
+        QTimer.singleShot(0, self.reveal_preview)  # bring the new preview into view (the page scrolls)
         self._mark_file_statuses(plan)
         if plan.sort is not None:
             self.files_panel.apply_sort(plan.sort.by, plan.sort.descending)
@@ -925,6 +953,8 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
         """Catch folder/file drops anywhere in this window (child widgets would swallow them)."""
         kind = event.type()
+        if kind == QEvent.Type.Resize and hasattr(self, "scroll") and obj is self.scroll.viewport():
+            self._fit_sections()
         if kind in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
             if isinstance(obj, QWidget) and obj.window() is self and event.mimeData().hasUrls():  # type: ignore[attr-defined]
                 if kind == QEvent.Type.Drop:

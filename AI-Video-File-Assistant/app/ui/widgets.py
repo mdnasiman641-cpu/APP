@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QEvent, QObject, QSize, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -78,8 +79,8 @@ class Card(QFrame):
         self.setObjectName("Card")
         self._tr = Retranslator()
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 14, 16, 16)
-        outer.setSpacing(10)
+        outer.setContentsMargins(18, 16, 18, 18)
+        outer.setSpacing(12)
         self.header = QHBoxLayout()
         self.header.setSpacing(8)
         self.title_label = QLabel()
@@ -87,7 +88,7 @@ class Card(QFrame):
         self.header.addWidget(self.title_label)
         self.header.addStretch(1)
         self.body = QVBoxLayout()
-        self.body.setSpacing(10)
+        self.body.setSpacing(12)
         outer.addLayout(self.header)
         outer.addLayout(self.body, 1)
         if title_key:
@@ -148,3 +149,37 @@ def confirm_destructive(parent: QWidget | None, text: str, ok_text: str) -> bool
     box.setDefaultButton(cancel)
     box.exec()
     return box.clickedButton() is ok
+
+
+class _WheelGuard(QObject):
+    """Lets the mouse wheel scroll the page instead of changing an unfocused combo box / spin box."""
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Wheel and isinstance(obj, QWidget) and not obj.hasFocus():
+            event.ignore()
+            return True
+        return False
+
+
+_WHEEL_GUARD: _WheelGuard | None = None
+
+
+def install_wheel_guard(widget: QWidget) -> None:
+    """Apply :class:`_WheelGuard` to ``widget`` (used for controls inside the scrolling page)."""
+    global _WHEEL_GUARD
+    if _WHEEL_GUARD is None:
+        _WHEEL_GUARD = _WheelGuard()
+    widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    widget.installEventFilter(_WHEEL_GUARD)
+
+
+def fit_to_screen(widget: QWidget, width: int, height: int) -> None:
+    """Open ``widget`` at a comfortable size: at least its layout's size hint, at most 90 % of the screen."""
+    hint = widget.sizeHint()
+    w, h = max(width, hint.width()), max(height, hint.height())
+    screen = widget.screen() or QApplication.primaryScreen()
+    if screen is not None:
+        area = screen.availableGeometry()
+        w, h = min(w, int(area.width() * 0.9)), min(h, int(area.height() * 0.9))
+    widget.resize(w, h)
+

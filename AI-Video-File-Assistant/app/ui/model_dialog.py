@@ -28,7 +28,7 @@ from app.ai.model_config import PROVIDER_TYPES, ModelConfig, normalize_base_url
 from app.ai.model_registry import ModelRegistry, RegistryError
 from app.config.constants import SUGGESTED_MODELS, Capability, ProviderType
 from app.i18n import tr
-from app.ui.widgets import confirm_destructive
+from app.ui.widgets import confirm_destructive, fit_to_screen
 from app.workers.ai_worker import ConnectionTestWorker, LoadModelsWorker
 from app.workers.base_worker import BaseWorker
 
@@ -68,7 +68,6 @@ class ModelDialog(QDialog):
         self._workers: set[BaseWorker] = set()
         self._replacing_key = config is None or not registry.has_key(config.id)
         self.setWindowTitle(tr("models.edit_title") if config else tr("models.add_title"))
-        self.setMinimumWidth(620)
         self.setModal(True)
 
         root = QVBoxLayout(self)
@@ -164,6 +163,7 @@ class ModelDialog(QDialog):
         root.addLayout(buttons)
 
         self._load(config, default_timeout, default_retries)
+        fit_to_screen(self, 720, self.sizeHint().height())  # never narrower than its layout needs
 
     # =================================================================== build
     def _build_key_area(self) -> QWidget:

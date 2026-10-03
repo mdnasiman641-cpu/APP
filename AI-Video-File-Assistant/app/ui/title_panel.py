@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QScrollArea,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -39,7 +38,10 @@ from app.ai.title_config import (
     save_preset,
 )
 from app.i18n import tr
-from app.ui.widgets import Retranslator, confirm_destructive
+from app.ui.widgets import Retranslator, confirm_destructive, install_wheel_guard
+
+
+TWO_COLUMN_MIN_WIDTH = 900  # page width needed for the two-column Title Generator layout
 
 
 class TitlePanel(QWidget):
@@ -55,14 +57,25 @@ class TitlePanel(QWidget):
         self._combos: dict[str, tuple[QComboBox, str]] = {}
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(6)
+        outer.setSpacing(0)
+        self.frame = QFrame()
+        self.frame.setObjectName("Section")
+        frame_layout = QVBoxLayout(self.frame)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        frame_layout.setSpacing(0)
+        outer.addWidget(self.frame)
 
-        header = QHBoxLayout()
+        self.header_bar = QFrame()
+        self.header_bar.setObjectName("SectionHeader")
+        header = QHBoxLayout(self.header_bar)
+        header.setContentsMargins(6, 4, 12, 4)
+        header.setSpacing(12)
         self.toggle = QToolButton()
         self.toggle.setCheckable(True)
         self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.toggle.setArrowType(Qt.ArrowType.RightArrow)
-        self.toggle.setObjectName("HeaderButton")
+        self.toggle.setObjectName("SectionToggle")
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self._tr.text(self.toggle, "tg.title")
         self.toggle.toggled.connect(self.set_expanded)
         self.enabled = QCheckBox()
@@ -70,25 +83,24 @@ class TitlePanel(QWidget):
         self._tr.tooltip(self.enabled, "tg.enabled_tip")
         self.enabled.toggled.connect(self._emit)
         header.addWidget(self.toggle)
-        header.addWidget(self.enabled)
         header.addStretch(1)
-        outer.addLayout(header)
+        header.addWidget(self.enabled)
+        frame_layout.addWidget(self.header_bar)
 
+        # No inner scroll area: when expanded, the section takes the height it needs and the page scrolls.
         self.body = QWidget()
+        self.body.setObjectName("SectionBody")
         body = QVBoxLayout(self.body)
-        body.setContentsMargins(4, 0, 4, 4)
-        body.setSpacing(8)
+        body.setContentsMargins(16, 12, 16, 16)
+        body.setSpacing(14)
         body.addLayout(self._build_main())
         body.addWidget(self._build_search())
         body.addLayout(self._build_presets())
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll.setWidget(self.body)
-        self.scroll.setMinimumHeight(220)
-        self.scroll.setMaximumHeight(340)
-        self.scroll.hide()
-        outer.addWidget(self.scroll)
+        self.body.hide()
+        frame_layout.addWidget(self.body)
+        for kind in (QComboBox, QSpinBox):
+            for widget in self.body.findChildren(kind):
+                install_wheel_guard(widget)
         self.retranslate()
         self.set_config(TitleConfig())
         self.refresh_presets()
@@ -151,52 +163,115 @@ class TitlePanel(QWidget):
         self.avoid_filename = self._check("tg.avoid_filename", "tg.avoid_filename_tip")
         self.prevent_duplicates = self._check("tg.prevent_duplicates")
         self.instructions = QPlainTextEdit()
-        self.instructions.setMaximumHeight(60)
+        self.instructions.setMinimumHeight(104)
+        self.instructions.setMaximumHeight(200)
         self._tr.placeholder(self.instructions, "tg.instructions_ph")
         self.instructions.textChanged.connect(self._on_changed)
 
-        rows: list[tuple[str, QWidget, str | None, QWidget | None]] = [
-            ("tg.mode", self.mode, "tg.source", self.source),
-            ("tg.category", self.category, "tg.custom_category", self.custom_category),
-            ("tg.topic", self.topic, "tg.keywords", self.keywords),
-            ("tg.style", self.style, "tg.custom_style", self.custom_style),
-            ("tg.tone", self.tone, "tg.custom_tone", self.custom_tone),
-        ]
-        for row, (k1, w1, k2, w2) in enumerate(rows):
-            grid.addWidget(self._label(k1), row, 0)
-            grid.addWidget(w1, row, 1)
-            if k2 and w2 is not None:
-                grid.addWidget(self._label(k2), row, 2)
-                grid.addWidget(w2, row, 3)
-        words = QHBoxLayout()
-        words.addWidget(self.capacity, 1)
-        words.addWidget(self._label("tg.min"))
-        words.addWidget(self.min_words)
-        words.addWidget(self._label("tg.max"))
-        words.addWidget(self.max_words)
-        grid.addWidget(self._label("tg.capacity"), 5, 0)
-        grid.addLayout(words, 5, 1)
-        grid.addWidget(self.use_prefix, 5, 2)
-        grid.addWidget(self.prefix, 5, 3)
-        grid.addWidget(self._label("tg.variation"), 6, 0)
-        grid.addWidget(self.variation, 6, 1)
-        checks = QHBoxLayout()
-        for box in (self.unique, self.avoid_filename, self.prevent_duplicates, self.prefix_counts):
-            checks.addWidget(box)
-        checks.addStretch(1)
-        grid.addLayout(checks, 6, 2, 1, 2)
-        grid.addWidget(self._label("tg.instructions"), 7, 0, Qt.AlignmentFlag.AlignTop)
-        grid.addWidget(self.instructions, 7, 1, 1, 3)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(3, 1)
-        return grid
+        words = QWidget()
+        words_row = QHBoxLayout(words)
+        words_row.setContentsMargins(0, 0, 0, 0)
+        words_row.setSpacing(8)
+        words_row.addWidget(self.capacity, 1)
+        words_row.addWidget(self._label("tg.min"))
+        words_row.addWidget(self.min_words)
+        words_row.addWidget(self._label("tg.max"))
+        words_row.addWidget(self.max_words)
+        prefix = QWidget()
+        prefix_row = QHBoxLayout(prefix)
+        prefix_row.setContentsMargins(0, 0, 0, 0)
+        prefix_row.setSpacing(10)
+        prefix_row.addWidget(self.prefix, 1)
+        prefix_row.addWidget(self.prefix_counts)
+        checks = QWidget()
+        self.checks_grid = QGridLayout(checks)
+        self.checks_grid.setContentsMargins(0, 4, 0, 0)
+        self.checks_grid.setHorizontalSpacing(18)
+        self.checks_grid.setVerticalSpacing(10)
+
+        # (cell, full_width) - pairs of half-width cells form two-column rows on wide windows
+        self._cells: list[tuple[QWidget, bool]] = [
+            (self._cell("tg.mode", self.mode), False), (self._cell("tg.source", self.source), False),
+            (self._cell("tg.category", self.category), False), (self._cell("tg.custom_category", self.custom_category), False),
+            (self._cell("tg.topic", self.topic), True),
+            (self._cell("tg.keywords", self.keywords), True),
+            (self._cell("tg.style", self.style), False), (self._cell("tg.tone", self.tone), False),
+            (self._cell("tg.custom_style", self.custom_style), False), (self._cell("tg.custom_tone", self.custom_tone), False),
+            (self._cell("tg.capacity", words), False), (self._cell("tg.variation", self.variation), False),
+            (self._cell(None, prefix, header=self.use_prefix), True),
+            (checks, True),
+            (self._cell("tg.instructions", self.instructions), True),
+        ]  # fmt: skip
+        self.grid = QGridLayout()
+        self.grid.setHorizontalSpacing(20)
+        self.grid.setVerticalSpacing(14)
+        self._columns = 0
+        self._relayout(2)
+        return self.grid
+
+    def _cell(self, label_key: str | None, field: QWidget, *, header: QWidget | None = None) -> QWidget:
+        """A label above its field (keeps labels readable in both one- and two-column layouts)."""
+        cell = QWidget()
+        layout = QVBoxLayout(cell)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        if header is not None:
+            layout.addWidget(header)
+        elif label_key:
+            label = self._label(label_key)
+            label.setObjectName("FieldLabel")
+            layout.addWidget(label)
+        layout.addWidget(field)
+        return cell
+
+    def _relayout(self, columns: int) -> None:
+        """Two columns on wide windows, one column on narrow ones."""
+        if columns == self._columns:
+            return
+        self._columns = columns
+        while self.grid.count():
+            self.grid.takeAt(0)
+        row = col = 0
+        for cell, full in self._cells:
+            if full or columns == 1:
+                if col:
+                    row, col = row + 1, 0
+                self.grid.addWidget(cell, row, 0, 1, columns)
+                row += 1
+                continue
+            self.grid.addWidget(cell, row, col)
+            col += 1
+            if col == columns:
+                row, col = row + 1, 0
+        for c in range(2):
+            self.grid.setColumnStretch(c, 1 if c < columns else 0)
+        boxes = (self.unique, self.avoid_filename, self.prevent_duplicates)
+        for box in boxes:
+            self.checks_grid.removeWidget(box)
+        for i, box in enumerate(boxes):  # one row on wide windows, stacked on narrow ones
+            self.checks_grid.addWidget(box, *((0, i) if columns == 2 else (i, 0)))
+        self.checks_grid.setColumnStretch(3, 1)
+
+    def set_available_width(self, width: int) -> None:
+        """Called by the main window with the page width: two columns only when there is room for them."""
+        self._available = width
+        self._relayout(2 if width >= TWO_COLUMN_MIN_WIDTH else 1)
+
+    def resizeEvent(self, event: Any) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self._available is None:  # stand-alone use (no page width known): follow our own width
+            self._relayout(2 if self.width() >= TWO_COLUMN_MIN_WIDTH - 60 else 1)
+
+    _available: int | None = None
 
     def _build_search(self) -> QWidget:
         self.search_box = QFrame()
         self.search_box.setObjectName("Card")
         form = QFormLayout(self.search_box)
-        form.setContentsMargins(10, 8, 10, 8)
-        form.setSpacing(6)
+        form.setContentsMargins(16, 14, 16, 14)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(12)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.query_mode = self._combo("query_mode", QUERY_MODES, "tg.query.")
         self.max_results = self._combo("max_results", MAX_RESULTS, "")
         self.use_filename_lookup = self._check("tg.filename_lookup", "tg.filename_lookup_tip")
@@ -219,6 +294,8 @@ class TitlePanel(QWidget):
         form.addRow(self._label("tg.query_mode"), top)
         form.addRow(self._label("tg.custom_query"), self.custom_query)
         boxes = QGridLayout()
+        boxes.setHorizontalSpacing(18)
+        boxes.setVerticalSpacing(10)
         for i, box in enumerate((self.use_filename_lookup, self.compare_results, self.context_only, self.completely_new,
                                  self.search_fallback)):  # fmt: skip
             boxes.addWidget(box, i // 2, i % 2)
@@ -226,11 +303,14 @@ class TitlePanel(QWidget):
         form.addRow(self.search_hint)
         return self.search_box
 
-    def _build_presets(self) -> QHBoxLayout:
+    def _build_presets(self) -> QVBoxLayout:
+        outer = QVBoxLayout()
+        outer.setSpacing(6)
         row = QHBoxLayout()
+        row.setSpacing(10)
         row.addWidget(self._label("tg.preset"))
         self.preset_combo = QComboBox()
-        self.preset_combo.setMinimumWidth(200)
+        self.preset_combo.setMinimumWidth(140)
         row.addWidget(self.preset_combo, 1)
         self.save_preset_button = QPushButton()
         self.load_preset_button = QPushButton()
@@ -244,8 +324,10 @@ class TitlePanel(QWidget):
             row.addWidget(button)
         self.preset_status = QLabel()
         self.preset_status.setObjectName("Muted")
-        row.addWidget(self.preset_status)
-        return row
+        self.preset_status.setWordWrap(True)
+        outer.addLayout(row)
+        outer.addWidget(self.preset_status)
+        return outer
 
     # ================================================================ state
     def set_expanded(self, expanded: bool) -> None:
@@ -253,7 +335,7 @@ class TitlePanel(QWidget):
         self.toggle.setChecked(expanded)
         self.toggle.blockSignals(False)
         self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
-        self.scroll.setVisible(expanded)
+        self.body.setVisible(expanded)
 
     def set_search_configured(self, configured: bool) -> None:
         self._search_configured = configured

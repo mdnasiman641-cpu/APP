@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QKeyEvent, QResizeEvent
 from PySide6.QtWidgets import (
     QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -26,7 +27,7 @@ from app.ui.model_choice import (
     resolve_model_choice,
 )
 from app.ui.title_panel import TitlePanel
-from app.ui.widgets import Card, IconBinder, make_button
+from app.ui.widgets import Card, IconBinder, install_wheel_guard, make_button
 from app.utils.helpers import truncate
 
 
@@ -59,29 +60,33 @@ class CommandPanel(Card):
         self._busy = False
         self._registry = registry
 
-        row = QHBoxLayout()
-        row.setSpacing(8)
+        self.body.setSpacing(14)
+        row = QHBoxLayout()  # AI mode · model · processing
+        row.setSpacing(10)
+        tools = QHBoxLayout()  # Saved Prompts · Recent (moves below the selectors on narrow windows)
+        tools.setSpacing(6)
         self.strategy_combo = QComboBox()
-        self.strategy_combo.setMinimumWidth(150)
+        self.strategy_combo.setMinimumWidth(140)
         fill_strategy_combo(self.strategy_combo, RoutingStrategy.AUTO_FALLBACK.value)
         self._tr.tooltip(self.strategy_combo, "command.strategy_tip")
         self.strategy_combo.currentIndexChanged.connect(self._on_routing_changed)
-        row.addWidget(self.strategy_combo)
+        row.addWidget(self.strategy_combo, 2)
 
         self.model_combo = QComboBox()
-        self.model_combo.setMinimumWidth(190)
+        self.model_combo.setMinimumWidth(160)
         self.model_combo.addItem(tr("models.automatic"), AUTO)
         self._tr.tooltip(self.model_combo, "command.model_tip")
         self.model_combo.currentIndexChanged.connect(self._on_routing_changed)
-        row.addWidget(self.model_combo)
+        row.addWidget(self.model_combo, 3)
 
         self.mode_combo = QComboBox()
         for mode in ProcessingMode:
             self.mode_combo.addItem("", mode.value)
-        self.mode_combo.setMinimumWidth(220)
+        self.mode_combo.setMinimumWidth(180)
         self._tr.tooltip(self.mode_combo, "command.mode_tip")
-        row.addWidget(self.mode_combo)
-        row.addStretch(1)
+        row.addWidget(self.mode_combo, 3)
+        for combo in (self.strategy_combo, self.model_combo, self.mode_combo):
+            install_wheel_guard(combo)
 
         self.prompts_button = QToolButton()
         self.prompts_button.setObjectName("HeaderButton")
@@ -91,7 +96,7 @@ class CommandPanel(Card):
         self._tr.text(self.prompts_button, "command.saved_prompts")
         self.prompts_menu = QMenu(self)
         self.prompts_button.setMenu(self.prompts_menu)
-        row.addWidget(self.prompts_button)
+        tools.addWidget(self.prompts_button)
 
         self.recent_button = QToolButton()
         self.recent_button.setObjectName("HeaderButton")
@@ -101,8 +106,14 @@ class CommandPanel(Card):
         self._tr.text(self.recent_button, "command.recent")
         self.recent_menu = QMenu(self)
         self.recent_button.setMenu(self.recent_menu)
-        row.addWidget(self.recent_button)
-        self.body.addLayout(row)
+        tools.addWidget(self.recent_button)
+        self.top_grid = QGridLayout()
+        self.top_grid.setHorizontalSpacing(12)
+        self.top_grid.setVerticalSpacing(8)
+        self._routing_row, self._tools_row = row, tools
+        self._narrow: bool | None = None
+        self._place_top(narrow=False)
+        self.body.addLayout(self.top_grid)
 
         self.title_panel: TitlePanel | None = None
         if db is not None:  # the collapsible Title Generator section
@@ -110,8 +121,9 @@ class CommandPanel(Card):
             self.body.addWidget(self.title_panel)
 
         self.edit = CommandEdit()
-        self.edit.setMinimumHeight(64)
-        self.edit.setMaximumHeight(140)
+        self.edit.setObjectName("CommandEdit")
+        self.edit.setMinimumHeight(96)
+        self.edit.setMaximumHeight(200)
         self.edit.setTabChangesFocus(True)
         self.edit.submitted.connect(self.generate_requested)
         self.body.addWidget(self.edit)
@@ -143,6 +155,24 @@ class CommandPanel(Card):
 
         self.edit.textChanged.connect(self._update_counter)
         self.retranslate()
+
+    # ----------------------------------------------------------------- layout
+    def _place_top(self, *, narrow: bool) -> None:
+        """Selectors and the Saved Prompts / Recent buttons share one row, or two rows on narrow windows."""
+        if narrow == self._narrow:
+            return
+        self._narrow = narrow
+        for layout in (self._routing_row, self._tools_row):
+            self.top_grid.removeItem(layout)
+        self.top_grid.addLayout(self._routing_row, 0, 0)
+        if narrow:
+            self.top_grid.addLayout(self._tools_row, 1, 0, Qt.AlignmentFlag.AlignRight)
+        else:
+            self.top_grid.addLayout(self._tools_row, 0, 1)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._place_top(narrow=self.width() < 900)
 
     # --------------------------------------------------------------- accessors
     def command(self) -> str:

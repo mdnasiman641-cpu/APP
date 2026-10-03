@@ -76,7 +76,7 @@ def test_defaults_and_dependent_controls(panel):
     pick(panel.mode, "connected")
     assert panel.avoid_filename.isEnabled()
     panel.set_expanded(False)
-    assert not panel.scroll.isVisibleTo(panel)
+    assert not panel.body.isVisibleTo(panel)
 
 
 def test_config_roundtrip(panel):

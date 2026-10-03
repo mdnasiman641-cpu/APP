@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPersistentModelIndex, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont
+import re
+from typing import Any
+
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPersistentModelIndex, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -19,6 +22,7 @@ from app.i18n import tr
 from app.ui.widgets import Card, IconBinder, make_button
 
 _Index = QModelIndex | QPersistentModelIndex
+MAX_FITTED_ROWS = 1500  # above this, rows keep a fixed two-line height (sizing every row would be slow)
 COL_INCLUDE, COL_ACTION, COL_OLD, COL_ARROW, COL_NEW, COL_NOTE = range(6)
 KIND_KEYS = {
     OpKind.RENAME: "preview.rename",
@@ -157,8 +161,34 @@ class PreviewModel(QAbstractTableModel):
         return False
 
 
+_BREAKABLE = re.compile(r"([._\-/])")
+_WRAP_COLUMNS = (COL_OLD, COL_NEW, COL_NOTE)
+_CELL_PADDING = 32  # cell padding (QTableView::item in app.qss) + the style's text margins, with a safety margin
+
+
+def breakable(text: str) -> str:
+    """Display-only: allow line breaks after ``. _ - /`` so long file names without spaces can wrap."""
+    return _BREAKABLE.sub("\\1\u200b", text)
+
+
 class TintDelegate(QStyledItemDelegate):
-    """Paints each row's status tint (the stylesheet would otherwise ignore the model's background)."""
+    """Paints each row's status tint (the stylesheet would otherwise ignore the model's background) and
+    lets long old/new names wrap onto several lines so the complete name is always readable."""
+
+    def initStyleOption(self, option, index):  # type: ignore[no-untyped-def]  # noqa: ANN001, N802
+        super().initStyleOption(option, index)
+        if index.column() in _WRAP_COLUMNS and option.text:
+            option.text = breakable(option.text)
+
+    def sizeHint(self, option, index):  # type: ignore[no-untyped-def]  # noqa: ANN001, N802
+        size = super().sizeHint(option, index)
+        view = self.parent()
+        if index.column() in _WRAP_COLUMNS and isinstance(view, QTableView):
+            text = breakable(str(index.data(Qt.ItemDataRole.DisplayRole) or ""))
+            width = max(40, view.columnWidth(index.column()) - _CELL_PADDING)
+            rect = QFontMetrics(option.font).boundingRect(QRect(0, 0, width, 100_000), Qt.TextFlag.TextWordWrap, text)
+            size.setHeight(max(size.height(), rect.height() + 14))
+        return size
 
     def paint(self, painter, option, index):  # type: ignore[no-untyped-def]  # noqa: ANN001
         brush = index.data(Qt.ItemDataRole.BackgroundRole)
@@ -178,10 +208,12 @@ class PreviewPanel(Card):
         self.plan: Plan | None = None
         self.model = PreviewModel()
 
-        self.info = QLabel()
-        self.info.setObjectName("Muted")
+        self.info = QLabel()  # Completed · Model · Requests · Fallbacks · Files - wraps on narrow windows
+        self.info.setObjectName("PreviewStatus")
         self.info.setWordWrap(True)
-        self.header.insertWidget(1, self.info, 1)
+        self.info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.info.hide()
+        self.body.addWidget(self.info)
 
         self.table = QTableView()
         self.table.setModel(self.model)
@@ -190,11 +222,12 @@ class PreviewPanel(Card):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
-        self.table.setWordWrap(False)
-        self.table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.table.setWordWrap(True)  # long generated titles wrap instead of being cut off
+        self.table.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.table.verticalHeader().hide()
-        self.table.verticalHeader().setDefaultSectionSize(30)
-        self.table.setMinimumHeight(120)
+        self.table.verticalHeader().setDefaultSectionSize(36)
+        self.table.setMinimumHeight(220)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         header = self.table.horizontalHeader()
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -202,10 +235,17 @@ class PreviewPanel(Card):
         header.setSectionResizeMode(COL_NEW, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(COL_INCLUDE, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(COL_ARROW, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(COL_ACTION, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setColumnWidth(COL_INCLUDE, 44)
         self.table.setColumnWidth(COL_ACTION, 140)
         self.table.setColumnWidth(COL_ARROW, 28)
-        self.table.setColumnWidth(COL_NOTE, 280)
+        self.table.setColumnWidth(COL_NOTE, 260)
+        header.setMinimumSectionSize(28)
+        self._row_timer = QTimer(self)
+        self._row_timer.setSingleShot(True)
+        self._row_timer.setInterval(60)
+        self._row_timer.timeout.connect(self._fit_rows)
+        header.sectionResized.connect(lambda *_a: self._row_timer.start())
         self.model.changed.connect(self._update_summary)
         self.body.addWidget(self.table, 1)
 
@@ -216,6 +256,8 @@ class PreviewPanel(Card):
         self.body.addWidget(self.empty_label)
 
         footer = QHBoxLayout()
+        footer.setSpacing(10)
+        footer.setContentsMargins(0, 4, 0, 0)
         self.summary = QLabel()
         self.summary.setObjectName("Muted")
         self.summary.setWordWrap(True)
@@ -240,13 +282,33 @@ class PreviewPanel(Card):
         self.plan = plan
         self.model.set_plan(plan)
         self.info.setText(info)
+        self.info.setVisible(bool(info))
         self._update_summary()
+        self._fit_rows()
 
     def clear(self) -> None:
         self.plan = None
         self.model.set_plan(None)
         self.info.setText("")
+        self.info.hide()
         self._update_summary()
+
+    def _fit_rows(self) -> None:
+        """Rows grow to show the complete (wrapped) old/new names; huge previews use two-line rows for speed."""
+        rows = self.model.rowCount()
+        if rows == 0:
+            return
+        if rows <= MAX_FITTED_ROWS:
+            self.table.verticalHeader().setDefaultSectionSize(36)
+            self.table.resizeRowsToContents()
+        else:
+            self.table.verticalHeader().setDefaultSectionSize(48)
+
+    def resizeEvent(self, event: Any) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # the Note column takes a share of the width, so Old/New name keep most of the room on small windows
+        self.table.setColumnWidth(COL_NOTE, max(120, min(320, int(self.table.viewport().width() * 0.2))))
+        self._row_timer.start()
 
     def apply_count(self) -> int:
         """Number of user-visible changes that would be applied."""

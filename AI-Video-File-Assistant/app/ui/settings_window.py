@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -43,7 +44,7 @@ from app.context import AppContext
 from app.i18n import LANGUAGE_NAMES, tr
 from app.ui.model_choice import AUTO, fill_model_combo, fill_strategy_combo
 from app.ui.model_dialog import CAPABILITY_KEYS, ModelDialog, ModelPickerDialog
-from app.ui.widgets import Retranslator, confirm_destructive
+from app.ui.widgets import Retranslator, confirm_destructive, fit_to_screen
 from app.utils.logger import get_log_dir
 from app.utils.security import mask_key
 from app.workers.ai_worker import ConnectionTestWorker
@@ -77,7 +78,7 @@ class SettingsDialog(QDialog):
         self._workers: set[BaseWorker] = set()
         self._test_results: dict[str, ConnectionResult] = {}
         self._tr.title(self, "settings.title")
-        self.setMinimumSize(860, 640)
+        self.setMinimumSize(760, 560)
         self.setModal(True)
         self.original = ctx.settings.load()
 
@@ -96,6 +97,7 @@ class SettingsDialog(QDialog):
         self._load(self.original)
         self.refresh_models()
         self.retranslate()
+        fit_to_screen(self, 980, 760)
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -312,10 +314,14 @@ class SettingsDialog(QDialog):
         self.toggle_button = self._button("models.enable_disable", self.toggle_model)
         self.up_button = self._button("models.move_up", lambda: self.move_model(-1))
         self.down_button = self._button("models.move_down", lambda: self.move_model(1))
-        for button in (self.add_button, self.edit_button, self.remove_button, self.test_button, self.load_button,
-                       self.toggle_button, self.up_button, self.down_button):  # fmt: skip
-            row.addWidget(button)
-        row.addStretch(1)
+        buttons = QGridLayout()  # two rows of four so the dialog never needs sideways scrolling
+        buttons.setHorizontalSpacing(8)
+        buttons.setVerticalSpacing(8)
+        for i, button in enumerate((self.add_button, self.edit_button, self.remove_button, self.test_button,
+                                    self.load_button, self.toggle_button, self.up_button, self.down_button)):  # fmt: skip
+            buttons.addWidget(button, i // 4, i % 4)
+        buttons.setColumnStretch(4, 1)
+        row.addLayout(buttons)
         layout.addLayout(row)
         self.model_result = QLabel()
         self.model_result.setWordWrap(True)
