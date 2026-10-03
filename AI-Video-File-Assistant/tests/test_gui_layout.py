@@ -55,7 +55,9 @@ def test_one_page_scroll_reaches_every_section(window):
     settle()
     bar = window.scroll.verticalScrollBar()
     assert bar.maximum() > 0  # the page scrolls instead of squeezing sections
-    assert window.scroll.horizontalScrollBar().maximum() == 0  # no sideways page scrolling
+    widths = {name: getattr(window, name).minimumSizeHint().width()
+              for name in ("folder_card", "files_panel", "command_panel", "title_panel", "preview_panel")}  # fmt: skip
+    assert window.scroll.horizontalScrollBar().maximum() == 0, widths  # no sideways page scrolling
     for widget in (window.folder_card, window.files_panel, window.command_panel.generate_button, window.title_panel.instructions,
                    window.preview_panel.apply_button):  # fmt: skip
         window.scroll.ensureWidgetVisible(widget)

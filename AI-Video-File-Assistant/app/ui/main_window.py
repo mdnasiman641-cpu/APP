@@ -200,6 +200,7 @@ class MainWindow(QMainWindow):
         available = self.scroll.viewport().height() if hasattr(self, "scroll") else 700
         if hasattr(self, "scroll"):
             self.title_panel.set_available_width(self.scroll.viewport().width())
+            self.command_panel.set_available_width(self.scroll.viewport().width())
         self.files_panel.setMinimumHeight(max(360, int(available * 0.62)))
         self.preview_panel.setMinimumHeight(max(380, int(available * 0.62)))
 

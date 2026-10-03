@@ -43,6 +43,9 @@ class CommandEdit(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+NARROW_BELOW = 1000  # page width below which Saved Prompts / Recent move under the selectors
+
+
 class CommandPanel(Card):
     """Where the user writes a natural-language command (English or Bangla)."""
 
@@ -170,9 +173,17 @@ class CommandPanel(Card):
         else:
             self.top_grid.addLayout(self._tools_row, 0, 1)
 
+    def set_available_width(self, width: int) -> None:
+        """Called by the main window with the page width (our own width can be held up by the one-row layout)."""
+        self._available = width
+        self._place_top(narrow=width < NARROW_BELOW)
+
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self._place_top(narrow=self.width() < 900)
+        if self._available is None:  # stand-alone use: follow our own width
+            self._place_top(narrow=self.width() < NARROW_BELOW)
+
+    _available: int | None = None
 
     # --------------------------------------------------------------- accessors
     def command(self) -> str:
